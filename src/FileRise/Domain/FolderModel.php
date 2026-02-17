@@ -1943,6 +1943,17 @@ class FolderModel
             return []; // or ["error" => "..."]
         }
 
+        if ($parent !== null && !$includeCounts) {
+            $folderInfoList = self::getFolderListLocalShallow((string)$parent, $includeCounts, $baseDir);
+            if ($username !== null) {
+                $folderInfoList = array_values(array_filter(
+                    $folderInfoList,
+                    fn($row) => ACL::canRead($username, $perms, $row['folder'])
+                ));
+            }
+            return $folderInfoList;
+        }
+
         $folderInfoList = [];
 
         // root
@@ -1980,6 +1991,94 @@ class FolderModel
                 fn($row) => ACL::canRead($username, $perms, $row['folder'])
             ));
         }
+        return $folderInfoList;
+    }
+
+    private static function getFolderListLocalShallow(string $parent, bool $includeCounts, string $baseDir): array
+    {
+        $parentRel = trim(str_replace('\\', '/', $parent));
+        $parentRel = ($parentRel === '' || strcasecmp($parentRel, 'root') === 0)
+            ? 'root'
+            : trim($parentRel, '/');
+        if ($parentRel !== 'root') {
+            $parts = array_filter(explode('/', $parentRel), fn($p) => $p !== '');
+            foreach ($parts as $seg) {
+                if (!FS::isSafeSegment($seg)) {
+                    return [];
+                }
+            }
+            $parentRel = implode('/', $parts);
+        }
+
+        $folderInfoList = [];
+        $metaTarget = ($parentRel === 'root') ? 'root' : $parentRel;
+        $rootMetaFile = self::getMetadataFilePath($metaTarget);
+        $rootFileCount = null;
+        if ($includeCounts && file_exists($rootMetaFile)) {
+            $rootMetadata = json_decode(file_get_contents($rootMetaFile), true);
+            $rootFileCount = is_array($rootMetadata) ? count($rootMetadata) : 0;
+        }
+        $folderInfoList[] = [
+            "folder"       => $metaTarget,
+            "fileCount"    => $rootFileCount,
+            "metadataFile" => basename($rootMetaFile)
+        ];
+
+        if ($parentRel === 'root') {
+            $parentAbs = $baseDir;
+            $parentAcl = '';
+        } else {
+            $parentGuess = $baseDir . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $parentRel);
+            $parentAbs = FS::safeReal($baseDir, $parentGuess);
+            $parentAcl = $parentRel;
+        }
+        if ($parentAbs === null || !is_dir($parentAbs)) {
+            return $folderInfoList;
+        }
+
+        $entries = @scandir($parentAbs);
+        if (!is_array($entries)) {
+            return $folderInfoList;
+        }
+
+        $SKIP = FS::SKIP();
+        foreach ($entries as $name) {
+            if ($name === '.' || $name === '..') {
+                continue;
+            }
+            if ($name === '' || $name[0] === '.') {
+                continue;
+            }
+            if (FS::shouldIgnoreEntry($name, $parentAcl)) {
+                continue;
+            }
+            if (!FS::isSafeSegment($name)) {
+                continue;
+            }
+            if (in_array(strtolower($name), $SKIP, true)) {
+                continue;
+            }
+
+            $childAbs = $parentAbs . DIRECTORY_SEPARATOR . $name;
+            if (!is_dir($childAbs)) {
+                continue;
+            }
+
+            $childRel = ($parentRel === 'root') ? $name : ($parentRel . '/' . $name);
+            $metaFile = self::getMetadataFilePath($childRel);
+            $fileCount = null;
+            if ($includeCounts && file_exists($metaFile)) {
+                $metadata = json_decode(file_get_contents($metaFile), true);
+                $fileCount = is_array($metadata) ? count($metadata) : 0;
+            }
+
+            $folderInfoList[] = [
+                "folder"       => $childRel,
+                "fileCount"    => $fileCount,
+                "metadataFile" => basename($metaFile)
+            ];
+        }
+
         return $folderInfoList;
     }
 

@@ -9,7 +9,12 @@ import { openFolderShareModal } from './folderShareModal.js?v={{APP_QVER}}';
 import { fetchWithCsrf } from './auth.js?v={{APP_QVER}}';
 import { loadCsrfToken } from './appCore.js?v={{APP_QVER}}';
 import { withBase } from './basePath.js?v={{APP_QVER}}';
-import { startTransferProgress, finishTransferProgress } from './transferProgress.js?v={{APP_QVER}}';
+import { runTransferJob } from './transferJobs.js?v={{APP_QVER}}';
+import {
+  startTransferProgress,
+  updateTransferProgress,
+  finishTransferProgress
+} from './transferProgress.js?v={{APP_QVER}}';
 
 
 function detachFolderModalsToBody() {
@@ -106,6 +111,36 @@ export function getParentFolder(folder) {
   return lastSlash === -1 ? "root" : folder.substring(0, lastSlash);
 }
 
+function normalizeFolderToastKey(path) {
+  const raw = String(path || '').trim();
+  if (!raw || raw.toLowerCase() === 'root') return 'root';
+  return raw;
+}
+
+function formatFolderPathForToast(path) {
+  const key = normalizeFolderToastKey(path);
+  return key === 'root' ? (t('root_folder') || 'Root') : key;
+}
+
+function movedFolderNameForToast(path) {
+  const key = normalizeFolderToastKey(path);
+  if (key === 'root') return t('root_folder') || 'Root';
+  const parts = key.split('/').filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : key;
+}
+
+function buildMoveFolderSuccessToast(sourceFolder, destinationFolder) {
+  const movedName = movedFolderNameForToast(sourceFolder);
+  const sourceParent = normalizeFolderToastKey(getParentFolder(sourceFolder));
+  const destFolder = normalizeFolderToastKey(destinationFolder);
+  const destLabel = formatFolderPathForToast(destFolder);
+  if (sourceParent !== destFolder) {
+    const sourceLabel = formatFolderPathForToast(sourceParent);
+    return t('move_folder_success_named_from_to', { name: movedName, source: sourceLabel, folder: destLabel });
+  }
+  return t('move_folder_success_named_to', { name: movedName, folder: destLabel });
+}
+
 let __moveFolderSourcesCache = null;
 
 function getActiveSourceId() {
@@ -118,6 +153,16 @@ function getActiveSourceId() {
     const stored = localStorage.getItem('fr_active_source');
     if (stored) return stored;
   } catch (e) {}
+  return '';
+}
+
+function getPaneKeyForSourceId(sourceId = '') {
+  const id = String(sourceId || '').trim();
+  if (!id || !window.__frPaneState || typeof window.__frPaneState !== 'object') return '';
+  const primaryId = String(window.__frPaneState.primary?.sourceId || '').trim();
+  const secondaryId = String(window.__frPaneState.secondary?.sourceId || '').trim();
+  if (primaryId && primaryId === id) return 'primary';
+  if (secondaryId && secondaryId === id) return 'secondary';
   return '';
 }
 
@@ -2235,68 +2280,50 @@ function handleDropOnFolder(event, dropFolder) {
       return;
     }
 
-    const progress = startTransferProgress({
-      action: 'Moving',
-      itemCount: 1,
-      itemLabel: 'folder',
-      bytesKnown: false,
-      indeterminate: true,
-      source: sourceFolder,
-      destination: dropFolder
-    });
-    let ok = false;
-    let errMsg = '';
-
-    fetchWithCsrf("/api/folder/moveFolder.php", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({
+    runTransferJob({
+      kind: 'folder_move',
+      payload: {
         source: sourceFolder,
         destination: dropFolder,
         sourceId,
         destSourceId
-      })
+      },
+      progress: {
+        action: 'Moving',
+        itemCount: 1,
+        itemLabel: 'folder',
+        bytesKnown: false,
+        indeterminate: true,
+        source: sourceFolder,
+        destination: dropFolder
+      }
     })
-      .then(safeJson)
-      .then(async (data) => {
-        if (data && !data.error) {
-          ok = true;
-          const destLabel = dropFolder || t('root_folder');
-          showToast(t('move_folder_success_to', { folder: destLabel }), 'success');
-          if (crossSource) {
-            try {
-              if (sourceFolder) {
-                const srcParent = getParentFolder(sourceFolder);
-                window.dispatchEvent(new CustomEvent('folderStatsInvalidated', {
-                  detail: { folders: [srcParent], sourceId }
-                }));
-              }
-              if (dropFolder) {
-                window.dispatchEvent(new CustomEvent('folderStatsInvalidated', {
-                  detail: { folders: [dropFolder], sourceId: destSourceId }
-                }));
-              }
-            } catch (e) { /* ignore */ }
-            loadFileList(dropFolder);
-          } else {
-            // reuse the shared tree-sync helper so icons, chevrons, selection, and file list all match
-            await syncTreeAfterFolderMove(sourceFolder, dropFolder);
-          }
+      .then(async () => {
+        showToast(buildMoveFolderSuccessToast(sourceFolder, dropFolder), 'success');
+        if (crossSource) {
+          try {
+            if (sourceFolder) {
+              const srcParent = getParentFolder(sourceFolder);
+              window.dispatchEvent(new CustomEvent('folderStatsInvalidated', {
+                detail: { folders: [srcParent], sourceId }
+              }));
+            }
+            if (dropFolder) {
+              window.dispatchEvent(new CustomEvent('folderStatsInvalidated', {
+                detail: { folders: [dropFolder], sourceId: destSourceId }
+              }));
+            }
+          } catch (e) { /* ignore */ }
+          loadFileList(dropFolder);
         } else {
-          ok = false;
-          errMsg = data && data.error ? data.error : t('move_folder_error_default');
-          showToast(t('move_folder_error_detail', { error: errMsg }), 5000, 'error');
+          // reuse the shared tree-sync helper so icons, chevrons, selection, and file list all match
+          await syncTreeAfterFolderMove(sourceFolder, dropFolder);
         }
       })
       .catch(err => {
-        ok = false;
-        errMsg = err && err.message ? err.message : t('move_folder_error_default');
+        const errMsg = err && err.message ? err.message : t('move_folder_error_default');
         console.error("Error moving folder:", err);
-        showToast(t('move_folder_error'), 5000, 'error');
-      })
-      .finally(() => {
-        finishTransferProgress(progress, { ok, error: errMsg });
+        showToast(t('move_folder_error_detail', { error: errMsg }), 5000, 'error');
       });
 
     return;
@@ -2321,45 +2348,27 @@ function handleDropOnFolder(event, dropFolder) {
       return;
     }
 
-    const progress = startTransferProgress({
-      action: 'Moving',
-      itemCount: 1,
-      itemLabel: 'folder',
-      bytesKnown: false,
-      indeterminate: true,
-      source: sourceFolder,
-      destination: dropFolder
-    });
-    let ok = false;
-    let errMsg = '';
-
-    fetchWithCsrf("/api/folder/moveFolder.php", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ source: sourceFolder, destination: dropFolder })
+    runTransferJob({
+      kind: 'folder_move',
+      payload: { source: sourceFolder, destination: dropFolder },
+      progress: {
+        action: 'Moving',
+        itemCount: 1,
+        itemLabel: 'folder',
+        bytesKnown: false,
+        indeterminate: true,
+        source: sourceFolder,
+        destination: dropFolder
+      }
     })
-      .then(safeJson)
-      .then(async (data) => {
-        if (data && !data.error) {
-          ok = true;
-          const destLabel = dropFolder || t('root_folder');
-          showToast(t('move_folder_success_to', { folder: destLabel }), 'success');
-          await syncTreeAfterFolderMove(sourceFolder, dropFolder);
-        } else {
-          ok = false;
-          errMsg = data && data.error ? data.error : t('move_folder_error_default');
-          showToast(t('move_folder_error_detail', { error: errMsg }), 5000, 'error');
-        }
+      .then(async () => {
+        showToast(buildMoveFolderSuccessToast(sourceFolder, dropFolder), 'success');
+        await syncTreeAfterFolderMove(sourceFolder, dropFolder);
       })
       .catch(err => {
-        ok = false;
-        errMsg = err && err.message ? err.message : t('move_folder_error_default');
+        const errMsg = err && err.message ? err.message : t('move_folder_error_default');
         console.error("Error moving folder:", err);
-        showToast(t('move_folder_error'), 5000, 'error');
-      })
-      .finally(() => {
-        finishTransferProgress(progress, { ok, error: errMsg });
+        showToast(t('move_folder_error_detail', { error: errMsg }), 5000, 'error');
       });
 
     return;
@@ -2379,77 +2388,67 @@ function handleDropOnFolder(event, dropFolder) {
     bytesKnown: dragData?.bytesKnown === true,
     itemCount: filesToMove.length
   };
-  const progress = startTransferProgress({
-    action: 'Moving',
-    itemCount: totals.itemCount,
-    itemLabel: totals.itemCount === 1 ? 'file' : 'files',
-    totalBytes: totals.totalBytes,
-    bytesKnown: totals.bytesKnown,
-    source: dragData.sourceFolder,
-    destination: dropFolder
-  });
-  let ok = false;
-  let errMsg = '';
-
-  fetchWithCsrf("/api/file/moveFiles.php", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify({
+  runTransferJob({
+    kind: 'file_move',
+    payload: {
       source: dragData.sourceFolder,
       files: filesToMove,
       destination: dropFolder,
       sourceId,
-      destSourceId
-    })
-  }).then(safeJson).then(data => {
-    if (data.success) {
-      ok = true;
-      const destLabel = dropFolder || t('root_folder');
-      showToast(t('move_files_success_to', { count: filesToMove.length, folder: destLabel }), 'success');
-      const activeSourceId = getActiveSourceId();
-      if (!sourceId || sourceId === activeSourceId) {
-        refreshFolderIcon(dragData.sourceFolder);
-      }
-      if (!destSourceId || destSourceId === activeSourceId) {
-        refreshFolderIcon(dropFolder);
-      }
-      try {
-        if (crossSource) {
-          if (dragData.sourceFolder) {
-            window.dispatchEvent(new CustomEvent('folderStatsInvalidated', {
-              detail: { folders: [dragData.sourceFolder], sourceId }
-            }));
-          }
-          if (dropFolder) {
-            window.dispatchEvent(new CustomEvent('folderStatsInvalidated', {
-              detail: { folders: [dropFolder], sourceId: destSourceId }
-            }));
-          }
-        } else {
-          const folders = [dragData.sourceFolder, dropFolder].filter(Boolean);
-          if (folders.length) {
-            window.dispatchEvent(new CustomEvent('folderStatsInvalidated', {
-              detail: { folders, sourceId: sourceId || destSourceId }
-            }));
-          }
-        }
-      } catch (e) { /* ignore */ }
-      const reloadFolder = crossSource
-        ? (window.currentFolder || dropFolder || dragData.sourceFolder)
-        : dragData.sourceFolder;
-      loadFileList(reloadFolder);
-    } else {
-      ok = false;
-      errMsg = data.error || t('unknown_error');
-      showToast(t('move_files_error', { error: errMsg }), 'error');
+      destSourceId,
+      totalBytes: totals.totalBytes
+    },
+    progress: {
+      action: 'Moving',
+      itemCount: totals.itemCount,
+      itemLabel: totals.itemCount === 1 ? 'file' : 'files',
+      totalBytes: totals.totalBytes,
+      bytesKnown: totals.bytesKnown,
+      source: dragData.sourceFolder,
+      destination: dropFolder
     }
+  }).then(() => {
+    const destLabel = dropFolder || t('root_folder');
+    if (filesToMove.length === 1) {
+      showToast(t('move_file_success_to', { name: filesToMove[0], folder: destLabel }), 'success');
+    } else {
+      showToast(t('move_files_success_to', { count: filesToMove.length, folder: destLabel }), 'success');
+    }
+    const activeSourceId = getActiveSourceId();
+    if (!sourceId || sourceId === activeSourceId) {
+      refreshFolderIcon(dragData.sourceFolder);
+    }
+    if (!destSourceId || destSourceId === activeSourceId) {
+      refreshFolderIcon(dropFolder);
+    }
+    try {
+      if (crossSource) {
+        if (dragData.sourceFolder) {
+          window.dispatchEvent(new CustomEvent('folderStatsInvalidated', {
+            detail: { folders: [dragData.sourceFolder], sourceId }
+          }));
+        }
+        if (dropFolder) {
+          window.dispatchEvent(new CustomEvent('folderStatsInvalidated', {
+            detail: { folders: [dropFolder], sourceId: destSourceId }
+          }));
+        }
+      } else {
+        const folders = [dragData.sourceFolder, dropFolder].filter(Boolean);
+        if (folders.length) {
+          window.dispatchEvent(new CustomEvent('folderStatsInvalidated', {
+            detail: { folders, sourceId: sourceId || destSourceId }
+          }));
+        }
+      }
+    } catch (e) { /* ignore */ }
+    const reloadFolder = crossSource
+      ? (window.currentFolder || dropFolder || dragData.sourceFolder)
+      : dragData.sourceFolder;
+    loadFileList(reloadFolder);
   }).catch(err => {
-    ok = false;
-    errMsg = err && err.message ? err.message : t('unknown_error');
-    showToast(t('move_files_error_generic'), 'error');
-  }).finally(() => {
-    finishTransferProgress(progress, { ok, error: errMsg });
+    const errMsg = err && err.message ? err.message : t('unknown_error');
+    showToast(t('move_files_error', { error: errMsg }), 'error');
   });
   return;
 }
@@ -2982,8 +2981,17 @@ async function setFolderEncryption(folder, encrypted) {
    Encryption v2: confirm + progress UI (minimizable)
 ----------------------*/
 const CRYPTO_JOB_STORAGE_KEY = 'frCryptoJob';
+const CRYPTO_SPEED_STORAGE_KEY = 'frTransferSpeedBps';
+const CRYPTO_DEFAULT_SPEED_BPS = 4 * 1024 * 1024;
+const CRYPTO_MIN_SPEED_BPS = 256 * 1024;
+const CRYPTO_MAX_SPEED_BPS = 200 * 1024 * 1024;
 let __cryptoRunner = null;
 let __cryptoUiReady = false;
+let __cryptoTransferUiJob = null;
+
+function clampNum(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
 
 function formatBytes(n) {
   const num = Number(n || 0);
@@ -2994,6 +3002,44 @@ function formatBytes(n) {
   while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
   const dp = (i === 0) ? 0 : (i === 1 ? 0 : 1);
   return `${v.toFixed(dp)} ${units[i]}`;
+}
+
+function formatDuration(ms) {
+  const total = Math.max(0, Math.floor(Number(ms || 0) / 1000));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function readCryptoEstimateSpeed() {
+  try {
+    const raw = parseFloat(localStorage.getItem(CRYPTO_SPEED_STORAGE_KEY));
+    if (Number.isFinite(raw) && raw > 0) {
+      return clampNum(raw, CRYPTO_MIN_SPEED_BPS, CRYPTO_MAX_SPEED_BPS);
+    }
+  } catch (e) { /* ignore */ }
+  return CRYPTO_DEFAULT_SPEED_BPS;
+}
+
+function estimateCryptoProgress(totalBytes, doneBytes, elapsedMs) {
+  if (!Number.isFinite(totalBytes) || totalBytes <= 0) return null;
+
+  let bps = readCryptoEstimateSpeed();
+  if (Number.isFinite(doneBytes) && doneBytes > 0 && elapsedMs > 1000) {
+    const observed = (doneBytes * 1000) / Math.max(1, elapsedMs);
+    if (Number.isFinite(observed) && observed > 0) {
+      bps = clampNum((bps * 0.45) + (observed * 0.55), CRYPTO_MIN_SPEED_BPS, CRYPTO_MAX_SPEED_BPS);
+    }
+  }
+
+  const estDone = clampNum(
+    Math.max(Number.isFinite(doneBytes) ? doneBytes : 0, Math.round((elapsedMs / 1000) * bps)),
+    0,
+    totalBytes
+  );
+  const pct = clampNum(Math.round((estDone / Math.max(1, totalBytes)) * 100), 0, 97);
+  const etaMs = Math.max(0, Math.round(((totalBytes - estDone) / Math.max(1, bps)) * 1000));
+  return { pct, estDone, etaMs, bps };
 }
 
 function setEncryptedClassForRenderedSubtree(folder, encrypted) {
@@ -3015,61 +3061,9 @@ function setEncryptedClassForRenderedSubtree(folder, encrypted) {
 function ensureCryptoJobUi() {
   if (__cryptoUiReady) return;
   __cryptoUiReady = true;
-
-  if (!document.getElementById('frCryptoJobModal')) {
-    const modal = document.createElement('div');
-    modal.id = 'frCryptoJobModal';
-    modal.className = 'fr-crypto-job-modal';
-    modal.style.display = 'none';
-    modal.innerHTML = `
-      <div class="fr-crypto-job-card" role="dialog" aria-modal="true" aria-label="Folder encryption progress">
-        <div class="fr-crypto-job-head">
-          <div class="fr-crypto-job-title" id="frCryptoJobTitle">Working…</div>
-          <div class="fr-crypto-job-actions">
-            <button type="button" class="btn btn-sm btn-outline-secondary" id="frCryptoJobMinBtn">Minimize</button>
-          </div>
-        </div>
-        <div class="fr-crypto-job-body">
-          <div class="fr-crypto-job-sub" id="frCryptoJobSub"></div>
-          <div class="fr-crypto-job-bar">
-            <div class="fr-crypto-job-bar-fill" id="frCryptoJobBarFill" style="width:0%"></div>
-          </div>
-          <div class="fr-crypto-job-metrics" id="frCryptoJobMetrics"></div>
-          <div class="fr-crypto-job-error" id="frCryptoJobError" style="display:none"></div>
-        </div>
-      </div>
-    `;
-    document.body.appendChild(modal);
-  }
-
-  if (!document.getElementById('frCryptoJobPill')) {
-    const pill = document.createElement('div');
-    pill.id = 'frCryptoJobPill';
-    pill.className = 'fr-crypto-job-pill';
-    pill.style.display = 'none';
-    pill.innerHTML = `
-      <button type="button" class="fr-crypto-job-pill-btn" id="frCryptoJobPillBtn">
-        <span class="fr-crypto-job-pill-title" id="frCryptoJobPillTitle">Working…</span>
-        <span class="fr-crypto-job-pill-pct" id="frCryptoJobPillPct">0%</span>
-      </button>
-    `;
-    document.body.appendChild(pill);
-  }
-
-  document.getElementById('frCryptoJobMinBtn')?.addEventListener('click', () => {
-    setCryptoUiMinimized(true);
-  });
-  document.getElementById('frCryptoJobPillBtn')?.addEventListener('click', () => {
-    setCryptoUiMinimized(false);
-  });
 }
 
 function setCryptoUiMinimized(min) {
-  ensureCryptoJobUi();
-  const modal = document.getElementById('frCryptoJobModal');
-  const pill = document.getElementById('frCryptoJobPill');
-  if (modal) modal.style.display = min ? 'none' : 'flex';
-  if (pill) pill.style.display = min ? 'block' : 'none';
   try {
     const cur = JSON.parse(localStorage.getItem(CRYPTO_JOB_STORAGE_KEY) || 'null');
     if (cur && typeof cur === 'object') {
@@ -3079,47 +3073,105 @@ function setCryptoUiMinimized(min) {
   } catch (e) { }
 }
 
+function ensureCryptoTransferUiJob(folder, mode, totalFiles = 0, totalBytes = 0) {
+  if (__cryptoTransferUiJob) return __cryptoTransferUiJob;
+
+  const act = mode === 'decrypt' ? 'Decrypting' : 'Encrypting';
+  const folderLabel = folder || 'root';
+  const fileCount = Number.isFinite(totalFiles) ? Math.max(0, Number(totalFiles)) : 0;
+  const byteTotal = Number.isFinite(totalBytes) ? Math.max(0, Number(totalBytes)) : 0;
+
+  __cryptoTransferUiJob = startTransferProgress({
+    action: act,
+    title: `${act} ${folderLabel}`,
+    subText: 'Running in the background. You can keep using FileRise.',
+    itemCount: fileCount,
+    itemLabel: fileCount === 1 ? 'file' : 'files',
+    totalBytes: byteTotal,
+    bytesKnown: byteTotal > 0,
+    indeterminate: byteTotal <= 0 && fileCount <= 0,
+    state: 'running'
+  });
+
+  return __cryptoTransferUiJob;
+}
+
 function renderCryptoJobUi({ folder, mode, job }) {
   ensureCryptoJobUi();
-  const titleEl = document.getElementById('frCryptoJobTitle');
-  const subEl = document.getElementById('frCryptoJobSub');
-  const barFill = document.getElementById('frCryptoJobBarFill');
-  const metrics = document.getElementById('frCryptoJobMetrics');
-  const errEl = document.getElementById('frCryptoJobError');
-  const pillTitle = document.getElementById('frCryptoJobPillTitle');
-  const pillPct = document.getElementById('frCryptoJobPillPct');
 
-  const act = (mode === 'decrypt') ? 'Decrypting' : 'Encrypting';
   const folderLabel = folder || (job && job.folder) || 'root';
+  const state = String(job?.state || 'running').toLowerCase();
   const totalFiles = Number(job?.totalFiles || 0);
   const totalBytes = Number(job?.totalBytes || 0);
   const doneFiles = Number(job?.doneFiles || 0);
   const doneBytes = Number(job?.doneBytes || 0);
 
-  const pct = totalFiles > 0
-    ? Math.min(100, Math.round((doneFiles / totalFiles) * 100))
-    : (totalBytes > 0 ? Math.min(100, Math.round((doneBytes / totalBytes) * 100)) : 0);
-
-  if (titleEl) titleEl.textContent = `${act} ${folderLabel}`;
-  if (subEl) subEl.textContent = (job?.state === 'running')
-    ? 'Running in the background. You can keep using FileRise.'
-    : (job?.state === 'done' ? 'Complete.' : '');
-
-  if (barFill) barFill.style.width = `${pct}%`;
-  if (metrics) {
-    const fPart = totalFiles > 0 ? `${doneFiles}/${totalFiles} files` : `${doneFiles} files`;
-    const bPart = totalBytes > 0 ? `${formatBytes(doneBytes)} / ${formatBytes(totalBytes)}` : `${formatBytes(doneBytes)}`;
-    metrics.textContent = `${fPart} • ${bPart}`;
+  let actualPct = null;
+  if (totalFiles > 0) {
+    actualPct = Math.min(100, Math.round((doneFiles / Math.max(1, totalFiles)) * 100));
+  }
+  if (totalBytes > 0) {
+    const bytesPct = Math.min(100, Math.round((doneBytes / Math.max(1, totalBytes)) * 100));
+    actualPct = Number.isFinite(actualPct) ? Math.max(actualPct, bytesPct) : bytesPct;
   }
 
-  if (pillTitle) pillTitle.textContent = act;
-  if (pillPct) pillPct.textContent = `${pct}%`;
+  const createdAtRaw = Number(job?.createdAt || job?.startedAt || 0);
+  const createdAtMs = createdAtRaw > 0 ? (createdAtRaw > 1e12 ? createdAtRaw : createdAtRaw * 1000) : Date.now();
+  const elapsedMs = Math.max(0, Date.now() - createdAtMs);
 
-  if (errEl) {
-    const err = job?.error ? String(job.error) : '';
-    errEl.style.display = err ? 'block' : 'none';
-    errEl.textContent = err;
+  const est = (state === 'running' && totalBytes > 0)
+    ? estimateCryptoProgress(totalBytes, doneBytes, elapsedMs)
+    : null;
+  let pct = Number.isFinite(actualPct) ? actualPct : 0;
+  let usingEstimate = false;
+  if (est && (!Number.isFinite(actualPct) || est.pct > actualPct + 1)) {
+    pct = est.pct;
+    usingEstimate = true;
   }
+  pct = clampNum(pct, 0, 100);
+
+  let displayDoneBytes = doneBytes;
+  if (usingEstimate && est) {
+    displayDoneBytes = Math.max(doneBytes, est.estDone);
+  }
+  if (state === 'done') {
+    pct = 100;
+    if (totalBytes > 0) {
+      displayDoneBytes = Math.max(displayDoneBytes, totalBytes);
+    }
+  }
+
+  const progressJob = ensureCryptoTransferUiJob(folderLabel, mode, totalFiles, totalBytes);
+  if (!progressJob) return;
+
+  const currentParts = [];
+  if (state === 'running') {
+    if (job?._tickPending) {
+      currentParts.push('Processing current file');
+    } else if (usingEstimate) {
+      currentParts.push('Estimated progress');
+    }
+    if (usingEstimate && est && Number.isFinite(est.etaMs)) {
+      currentParts.push(`ETA ${formatDuration(est.etaMs)}`);
+    }
+  } else if (state === 'done') {
+    currentParts.push('Complete');
+  }
+
+  let transferState = 'running';
+  if (state === 'done') transferState = 'done';
+  if (state === 'error') transferState = 'error';
+
+  updateTransferProgress(progressJob, {
+    status: transferState,
+    pct,
+    filesDone: Number.isFinite(doneFiles) ? doneFiles : 0,
+    filesTotal: Number.isFinite(totalFiles) ? totalFiles : 0,
+    bytesDone: Number.isFinite(displayDoneBytes) ? displayDoneBytes : 0,
+    bytesTotal: Number.isFinite(totalBytes) ? totalBytes : 0,
+    current: currentParts.join(' - '),
+    error: job?.error ? String(job.error) : ''
+  });
 }
 
 async function startCryptoRunner({ jobId, folder, mode, minimized }) {
@@ -3129,8 +3181,7 @@ async function startCryptoRunner({ jobId, folder, mode, minimized }) {
   }
 
   ensureCryptoJobUi();
-  const modal = document.getElementById('frCryptoJobModal');
-  if (modal) modal.style.display = minimized ? 'none' : 'flex';
+  ensureCryptoTransferUiJob(folder, mode, 0, 0);
   setCryptoUiMinimized(!!minimized);
 
   const tickOnce = async () => {
@@ -3147,10 +3198,29 @@ async function startCryptoRunner({ jobId, folder, mode, minimized }) {
     return safeJson(resp);
   };
 
+  let latestJob = null;
+  const tickWithHeartbeat = async () => {
+    let hb = null;
+    try {
+      hb = setInterval(() => {
+        if (!latestJob || String(latestJob.state || '').toLowerCase() !== 'running') return;
+        renderCryptoJobUi({
+          folder,
+          mode,
+          job: { ...latestJob, _tickPending: true }
+        });
+      }, 350);
+      return await tickOnce();
+    } finally {
+      if (hb) clearInterval(hb);
+    }
+  };
+
   const loop = async () => {
     try {
       const st = await statusOnce();
       const job = st?.job || null;
+      latestJob = job;
       renderCryptoJobUi({ folder, mode, job });
 
       if (!job || job.state === 'done') {
@@ -3162,8 +3232,9 @@ async function startCryptoRunner({ jobId, folder, mode, minimized }) {
         return;
       }
 
-      const tk = await tickOnce();
-      const job2 = tk?.job || job;
+      const tk = await tickWithHeartbeat();
+      const job2 = tk?.job || latestJob || job;
+      latestJob = job2;
       renderCryptoJobUi({ folder, mode, job: job2 });
 
       if (job2?.state === 'done') {
@@ -3219,11 +3290,14 @@ function finalizeCryptoJobUi({ folder, mode, jobId, ok, error }) {
     } catch (e) { /* ignore */ }
   }
 
-  // Hide UI
-  const modal = document.getElementById('frCryptoJobModal');
-  const pill = document.getElementById('frCryptoJobPill');
-  if (modal) modal.style.display = 'none';
-  if (pill) pill.style.display = 'none';
+  if (__cryptoTransferUiJob) {
+    finishTransferProgress(__cryptoTransferUiJob, {
+      ok: !!ok,
+      error: error ? String(error) : '',
+      state: ok ? 'done' : 'error'
+    });
+    __cryptoTransferUiJob = null;
+  }
 
   if (ok) {
     showToast(mode === 'decrypt' ? t('folder_decryption_completed') : t('folder_encryption_completed'), 'success');
@@ -3255,7 +3329,7 @@ export async function startFolderCryptoJobFlow(folder, mode) {
       `Are you sure you want to ${label} "${folder}"?\n\n` +
       `This will process ${totalFiles} file(s) (~${formatBytes(totalBytes)}).` +
       (truncated ? `\n\nNote: estimate was truncated for very large trees.` : '') +
-      `\n\nThis may take a while. A progress window will appear and can be minimized while you continue using FileRise.`;
+      `\n\nThis may take a while. Progress will appear in the Transfer Center while you continue using FileRise.`;
 
     const ok = await showCustomConfirmModal(msg);
     if (!ok) return;
@@ -3290,7 +3364,7 @@ export async function startFolderCryptoJobFlow(folder, mode) {
     renderCryptoJobUi({
       folder,
       mode,
-      job: { state: 'running', totalFiles, totalBytes, doneFiles: 0, doneBytes: 0 }
+      job: { state: 'running', totalFiles, totalBytes, doneFiles: 0, doneBytes: 0, createdAt: Math.floor(Date.now() / 1000) }
     });
 
     await startCryptoRunner(st);
@@ -3948,122 +4022,133 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // snapshot expansion before move
     const preState = loadFolderTreeState();
-    const progress = startTransferProgress({
-      action: mode === 'copy' ? 'Copying' : 'Moving',
-      itemCount: 1,
-      itemLabel: 'folder',
-      bytesKnown: false,
-      indeterminate: true,
-      source,
-      destination
-    });
-    let ok = false;
-    let errMsg = '';
 
     try {
-      const res = await fetch('/api/folder/moveFolder.php', {
-        method: 'POST', credentials: 'include',
-        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': window.csrfToken },
-        body: JSON.stringify({ source, destination, sourceId, destSourceId, mode })
-      });
-      const data = await safeJson(res);
-      if (res.ok && data && !data.error) {
-        ok = true;
-        const base = source.split('/').pop();
-        const newPath = (destination === 'root' ? '' : destination + '/') + base;
-
-        if (mode === 'copy') {
-          if (sameSource) {
-            const dstParent = destination;
-            invalidateFolderCaches(dstParent);
-            clearPeekCache([dstParent, newPath]);
-            const dstUl = getULForFolder(dstParent);
-            if (dstUl) { dstUl._renderedOnce = false; dstUl.innerHTML = ""; await ensureChildrenLoaded(dstParent, dstUl); }
-            updateToggleForOption(dstParent, true);
-            ensureFolderIcon(dstParent);
-            refreshFolderIcon(dstParent);
-            if (dstParent === 'root') placeRecycleBinNode();
-          }
-          if (modal) modal.style.display = 'none';
-          showToast(t('copy_folder_success'), 'success');
-          selectFolder(window.currentFolder || source);
-          return;
+      await runTransferJob({
+        kind: mode === 'copy' ? 'folder_copy' : 'folder_move',
+        payload: { source, destination, sourceId, destSourceId, mode },
+        progress: {
+          action: mode === 'copy' ? 'Copying' : 'Moving',
+          itemCount: 1,
+          itemLabel: 'folder',
+          bytesKnown: false,
+          indeterminate: true,
+          source,
+          destination
         }
+      });
+      const base = source.split('/').pop();
+      const newPath = (destination === 'root' ? '' : destination + '/') + base;
 
+      if (mode === 'copy') {
         if (sameSource) {
-          // carry color
-          await carryFolderColor(source, newPath);
-
-          // migrate expansion
-          migrateExpansionStateOnMove(source, newPath, [destination, getParentFolder(destination)]);
-
-          // refresh parents
-          const srcParent = getParentFolder(source);
           const dstParent = destination;
-          invalidateFolderCaches(srcParent); invalidateFolderCaches(dstParent);
-          clearPeekCache([srcParent, dstParent, source, newPath]);
-
-          const srcUl = getULForFolder(srcParent); const dstUl = getULForFolder(dstParent);
-          updateToggleForOption(srcParent, !!srcUl && !!srcUl.querySelector(':scope > li.folder-item'));
-          if (srcUl) { srcUl._renderedOnce = false; srcUl.innerHTML = ""; await ensureChildrenLoaded(srcParent, srcUl); }
+          invalidateFolderCaches(dstParent);
+          clearPeekCache([dstParent, newPath]);
+          const dstUl = getULForFolder(dstParent);
           if (dstUl) { dstUl._renderedOnce = false; dstUl.innerHTML = ""; await ensureChildrenLoaded(dstParent, dstUl); }
-          if (srcParent === 'root' || dstParent === 'root') placeRecycleBinNode();
-
           updateToggleForOption(dstParent, true);
           ensureFolderIcon(dstParent);
-          const _srcUlLive = getULForFolder(srcParent);
-          updateToggleForOption(srcParent, !!(_srcUlLive && _srcUlLive.querySelector(':scope > li.folder-item')));
-
-          // re-apply expansions
-          await expandAndLoadSavedState();
-
-          // update currentFolder
-          if (window.currentFolder === source) {
-            window.currentFolder = newPath;
-          } else if (window.currentFolder && window.currentFolder.startsWith(source + '/')) {
-            const suffix = window.currentFolder.slice(source.length);
-            window.currentFolder = newPath + suffix;
-          }
-          setLastOpenedFolder(window.currentFolder || newPath);
-
-          if (modal) modal.style.display = 'none';
-          refreshFolderIcon(srcParent); refreshFolderIcon(dstParent);
-          showToast(t('move_folder_success'), 'success');
-          selectFolder(window.currentFolder || newPath);
-          return;
+          refreshFolderIcon(dstParent);
+          if (dstParent === 'root') placeRecycleBinNode();
         }
+        if (modal) modal.style.display = 'none';
+        showToast(t('copy_folder_success'), 'success');
+        selectFolder(window.currentFolder || source);
+        return;
+      }
 
-        // cross-source move: remove from current tree, stay on parent
+      if (sameSource) {
+        // carry color
+        await carryFolderColor(source, newPath);
+
+        // migrate expansion
+        migrateExpansionStateOnMove(source, newPath, [destination, getParentFolder(destination)]);
+
+        // refresh parents
         const srcParent = getParentFolder(source);
-        invalidateFolderCaches(srcParent);
-        clearPeekCache([srcParent, source]);
-        const srcUl = getULForFolder(srcParent);
-        if (srcUl) { srcUl._renderedOnce = false; srcUl.innerHTML = ""; await ensureChildrenLoaded(srcParent, srcUl); }
-        updateToggleForOption(srcParent, !!(srcUl && srcUl.querySelector(':scope > li.folder-item')));
-        refreshFolderIcon(srcParent);
-        if (srcParent === 'root') placeRecycleBinNode();
+        const dstParent = destination;
+        invalidateFolderCaches(srcParent); invalidateFolderCaches(dstParent);
+        clearPeekCache([srcParent, dstParent, source, newPath]);
 
-        if (window.currentFolder === source || window.currentFolder.startsWith(source + '/')) {
-          window.currentFolder = srcParent;
-          setLastOpenedFolder(srcParent);
+        const srcUl = getULForFolder(srcParent); const dstUl = getULForFolder(dstParent);
+        updateToggleForOption(srcParent, !!srcUl && !!srcUl.querySelector(':scope > li.folder-item'));
+        if (srcUl) { srcUl._renderedOnce = false; srcUl.innerHTML = ""; await ensureChildrenLoaded(srcParent, srcUl); }
+        if (dstUl) { dstUl._renderedOnce = false; dstUl.innerHTML = ""; await ensureChildrenLoaded(dstParent, dstUl); }
+        if (srcParent === 'root' || dstParent === 'root') placeRecycleBinNode();
+
+        updateToggleForOption(dstParent, true);
+        ensureFolderIcon(dstParent);
+        const _srcUlLive = getULForFolder(srcParent);
+        updateToggleForOption(srcParent, !!(_srcUlLive && _srcUlLive.querySelector(':scope > li.folder-item')));
+
+        // re-apply expansions
+        await expandAndLoadSavedState();
+
+        // update currentFolder
+        if (window.currentFolder === source) {
+          window.currentFolder = newPath;
+        } else if (window.currentFolder && window.currentFolder.startsWith(source + '/')) {
+          const suffix = window.currentFolder.slice(source.length);
+          window.currentFolder = newPath + suffix;
         }
+        setLastOpenedFolder(window.currentFolder || newPath);
 
         if (modal) modal.style.display = 'none';
-        showToast(t('move_folder_success'), 'success');
-        selectFolder(window.currentFolder || srcParent);
-
-      } else {
-        ok = false;
-        errMsg = data && data.error ? data.error : t('move_failed');
-        showToast(t('error_prefix', { error: errMsg }), 'error');
+        refreshFolderIcon(srcParent); refreshFolderIcon(dstParent);
+        showToast(buildMoveFolderSuccessToast(source, destination), 'success');
+        selectFolder(window.currentFolder || newPath);
+        return;
       }
+
+      // cross-source move: remove from current tree, stay on parent
+      const srcParent = getParentFolder(source);
+      invalidateFolderCaches(srcParent);
+      clearPeekCache([srcParent, source]);
+      const srcUl = getULForFolder(srcParent);
+      if (srcUl) { srcUl._renderedOnce = false; srcUl.innerHTML = ""; await ensureChildrenLoaded(srcParent, srcUl); }
+      updateToggleForOption(srcParent, !!(srcUl && srcUl.querySelector(':scope > li.folder-item')));
+      refreshFolderIcon(srcParent);
+      if (srcParent === 'root') placeRecycleBinNode();
+
+      if (window.currentFolder === source || window.currentFolder.startsWith(source + '/')) {
+        window.currentFolder = srcParent;
+        setLastOpenedFolder(srcParent);
+      }
+
+      try {
+        const folders = [srcParent].filter(Boolean);
+        if (folders.length) {
+          window.dispatchEvent(new CustomEvent('folderStatsInvalidated', {
+            detail: { folders, sourceId }
+          }));
+        }
+      } catch (e) { /* ignore */ }
+      try {
+        const folders = [destination].filter(Boolean);
+        if (folders.length) {
+          window.dispatchEvent(new CustomEvent('folderStatsInvalidated', {
+            detail: { folders, sourceId: destSourceId }
+          }));
+        }
+      } catch (e) { /* ignore */ }
+
+      const destPaneKey = getPaneKeyForSourceId(destSourceId);
+      if (destPaneKey) {
+        const paneState = window.__frPaneState?.[destPaneKey] || {};
+        const destPaneFolder = String(paneState.currentFolder || destination || 'root').trim() || 'root';
+        try {
+          await loadFileList(destPaneFolder, { pane: destPaneKey, skipFallback: true });
+        } catch (e) { /* best effort */ }
+      }
+
+      if (modal) modal.style.display = 'none';
+      showToast(buildMoveFolderSuccessToast(source, destination), 'success');
+      selectFolder(window.currentFolder || srcParent);
     } catch (e) {
-      ok = false;
-      errMsg = e && e.message ? e.message : t('move_failed');
+      const errMsg = e && e.message ? e.message : t('move_failed');
       console.error(e);
-      showToast(t('move_failed'), 'error');
-    } finally {
-      finishTransferProgress(progress, { ok, error: errMsg });
+      showToast(t('error_prefix', { error: errMsg }), 'error');
     }
   });
 });

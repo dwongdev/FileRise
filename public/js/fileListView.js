@@ -51,7 +51,7 @@ import {
   folderDragLeaveHandler,
   folderDropHandler
 } from './fileDragDrop.js?v={{APP_QVER}}';
-import { startTransferProgress, finishTransferProgress } from './transferProgress.js?v={{APP_QVER}}';
+import { runTransferJob } from './transferJobs.js?v={{APP_QVER}}';
 
 export let fileData = [];
 export let sortOrder = { column: "modified", ascending: false };
@@ -242,6 +242,9 @@ function compareSemverLite(a, b) {
 
 
 const FOLDER_STRIP_PAGE_SIZE = 50;
+const SLOW_LOAD_TOAST_DELAY_MS = 8000;
+const SLOW_LOAD_TOAST_COOLDOWN_MS = 30000;
+let _lastSlowLoadToastAt = 0;
 // onnlyoffice
 let OO_ENABLED = false;
 let OO_EXTS = new Set();
@@ -287,7 +290,7 @@ function wireFolderStripItems(strip, sourceId = '') {
       const dest = el.dataset.folder;
       if (!dest) return;
 
-      setCurrentFolderContext(dest);
+      setCurrentFolderContext(dest, { resetPage: true });
 
       document.querySelectorAll(".folder-option.selected")
         .forEach(o => o.classList.remove("selected"));
@@ -304,7 +307,7 @@ function wireFolderStripItems(strip, sourceId = '') {
     el.addEventListener("drop", folderDropHandler);
 
     // 3) right-click context menu
-    el.addEventListener("contextmenu", e => {
+    el.addEventListener("contextmenu", async e => {
       e.preventDefault();
       e.stopPropagation();
 
@@ -314,6 +317,14 @@ function wireFolderStripItems(strip, sourceId = '') {
       strip.querySelectorAll(".folder-item.selected")
         .forEach(i => i.classList.remove("selected"));
       el.classList.add("selected");
+
+      let caps = null;
+      try {
+        caps = await fetchFolderCaps(dest, paneSourceId);
+      } catch (e2) { /* ignore */ }
+      const enc = (caps && caps.encryption) ? caps.encryption : {};
+      const canEncrypt = !!enc.canEncrypt;
+      const canDecrypt = !!enc.canDecrypt;
 
       const menuItems = [
         {
@@ -342,6 +353,16 @@ function wireFolderStripItems(strip, sourceId = '') {
           label: t("color_folder"),
           action: () => openColorFolderModal(dest)
         },
+        ...(canEncrypt ? [{
+          label: 'Encrypt folder',
+          icon: 'lock',
+          action: () => startFolderCryptoJobFlow(dest, 'encrypt')
+        }] : []),
+        ...(canDecrypt ? [{
+          label: 'Decrypt folder',
+          icon: 'lock_open',
+          action: () => startFolderCryptoJobFlow(dest, 'decrypt')
+        }] : []),
         {
           label: t("folder_share"),
           action: () => openFolderShareModal(dest)
@@ -1178,7 +1199,7 @@ function ensureHoverPreviewEl() {
     } else if (ctx.type === "folder") {
       const dest = ctx.folder;
       if (dest) {
-        setCurrentFolderContext(dest);
+        setCurrentFolderContext(dest, { resetPage: true });
         loadFileList(dest);
       }
     }
@@ -1204,6 +1225,36 @@ function parentFolderOf(path) {
   if (parts.length <= 1) return 'root';
   parts.pop();
   return parts.join('/');
+}
+
+function normalizeFolderToastKey(path) {
+  const raw = String(path || '').trim();
+  if (!raw || raw.toLowerCase() === 'root') return 'root';
+  return raw;
+}
+
+function formatFolderPathForToast(path) {
+  const key = normalizeFolderToastKey(path);
+  return key === 'root' ? (t('root_folder') || 'Root') : key;
+}
+
+function movedFolderNameForToast(path) {
+  const key = normalizeFolderToastKey(path);
+  if (key === 'root') return t('root_folder') || 'Root';
+  const parts = key.split('/').filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : key;
+}
+
+function buildMoveFolderSuccessToast(sourceFolder, destinationFolder) {
+  const movedName = movedFolderNameForToast(sourceFolder);
+  const sourceParent = normalizeFolderToastKey(parentFolderOf(sourceFolder));
+  const destFolder = normalizeFolderToastKey(destinationFolder);
+  const destLabel = formatFolderPathForToast(destFolder);
+  if (sourceParent !== destFolder) {
+    const sourceLabel = formatFolderPathForToast(sourceParent);
+    return t('move_folder_success_named_from_to', { name: movedName, source: sourceLabel, folder: destLabel });
+  }
+  return t('move_folder_success_named_to', { name: movedName, folder: destLabel });
 }
 
 function invalidateFolderStats(folders, sourceId = '') {
@@ -1463,6 +1514,10 @@ window.viewMode = localStorage.getItem("viewMode") || "table";
 window.currentSubfolders = window.currentSubfolders || [];
 window.currentSubfoldersSourceId = window.currentSubfoldersSourceId || '';
 window.currentSubfoldersFolder = window.currentSubfoldersFolder || '';
+window.currentFileListPaging = window.currentFileListPaging || null;
+
+const FILE_LIST_CURSOR_PAGE_SIZE_MIN = 10;
+const FILE_LIST_CURSOR_PAGE_SIZE_MAX = 500;
 
 const PANE_FOLDER_STORAGE_KEYS = {
   primary: 'frPaneFolderPrimary',
@@ -1739,6 +1794,7 @@ function ensurePaneState() {
       currentFolderCaps: window.currentFolderCaps || null,
       selectedFolderCaps: window.selectedFolderCaps || null,
       fileData: Array.isArray(fileData) ? fileData : [],
+      fileListPaging: window.currentFileListPaging || null,
       hasLoaded: false,
       needsReload: false
     },
@@ -1751,6 +1807,7 @@ function ensurePaneState() {
       currentFolderCaps: null,
       selectedFolderCaps: null,
       fileData: [],
+      fileListPaging: null,
       hasLoaded: false,
       needsReload: false
     }
@@ -1785,7 +1842,8 @@ function syncPaneStateFromGlobals(pane) {
     currentSearchTerm: window.currentSearchTerm || "",
     currentFolderCaps: window.currentFolderCaps || null,
     selectedFolderCaps: window.selectedFolderCaps || null,
-    fileData: Array.isArray(fileData) ? fileData : []
+    fileData: Array.isArray(fileData) ? fileData : [],
+    fileListPaging: window.currentFileListPaging || null
   });
 }
 
@@ -1800,6 +1858,129 @@ function syncGlobalsFromPaneState(pane) {
   window.currentFolderCaps = state.currentFolderCaps || null;
   window.selectedFolderCaps = state.selectedFolderCaps || null;
   fileData = Array.isArray(state.fileData) ? state.fileData : [];
+  window.currentFileListPaging = state.fileListPaging || null;
+}
+
+function getFileListCursorPageSize() {
+  const raw = parseInt(window.itemsPerPage || localStorage.getItem('itemsPerPage') || '50', 10);
+  const value = Number.isFinite(raw) ? raw : 50;
+  return Math.max(FILE_LIST_CURSOR_PAGE_SIZE_MIN, Math.min(FILE_LIST_CURSOR_PAGE_SIZE_MAX, value));
+}
+
+function getPaneFileListPaging(pane) {
+  const state = getPaneState(pane);
+  const paging = state && state.fileListPaging ? state.fileListPaging : null;
+  return (paging && paging.enabled) ? paging : null;
+}
+
+function setPaneFileListPaging(pane, paging) {
+  const normalized = normalizePaneKey(pane);
+  const next = (paging && paging.enabled) ? paging : null;
+  savePaneState(normalized, { fileListPaging: next });
+  if (normalized === normalizePaneKey(window.activePane)) {
+    window.currentFileListPaging = next;
+  }
+}
+
+function shouldUseServerFilePagingForRequest(options = {}) {
+  if (options && options.forceLegacy) {
+    return false;
+  }
+  if (window.advancedSearchEnabled) {
+    return false;
+  }
+  const term = String(window.currentSearchTerm || '').trim();
+  return term === '';
+}
+
+function parseCursorOffset(cursor) {
+  const text = String(cursor == null ? '' : cursor).trim();
+  if (!/^\d+$/.test(text)) return 0;
+  const value = parseInt(text, 10);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function getSubfoldersForPagingContext(pane, folder, sourceId = '') {
+  const paneKey = normalizePaneKey(pane);
+  const folderKey = String(folder || 'root');
+  const sourceKey = String(sourceId || '').trim();
+
+  const state = getPaneState(paneKey);
+  const stateSource = String(state?.currentSubfoldersSourceId || '').trim();
+  const stateFolder = String(state?.currentSubfoldersFolder || '');
+  if (stateSource === sourceKey && stateFolder === folderKey && Array.isArray(state?.currentSubfolders)) {
+    return state.currentSubfolders;
+  }
+
+  if (paneKey === normalizePaneKey(window.activePane)) {
+    const winSource = String(window.currentSubfoldersSourceId || '').trim();
+    const winFolder = String(window.currentSubfoldersFolder || '');
+    if (winSource === sourceKey && winFolder === folderKey && Array.isArray(window.currentSubfolders)) {
+      return window.currentSubfolders;
+    }
+  }
+
+  return [];
+}
+
+function getCombinedPageLayout({ totalFolders, totalFiles, itemsPerPage, targetPage }) {
+  const folderCount = Number.isFinite(Number(totalFolders)) ? Math.max(0, Number(totalFolders)) : 0;
+  const fileCount = Number.isFinite(Number(totalFiles)) ? Math.max(0, Number(totalFiles)) : 0;
+  const itemsRaw = Number(itemsPerPage);
+  const pageSize = Number.isFinite(itemsRaw) && itemsRaw > 0 ? Math.max(1, Math.floor(itemsRaw)) : 50;
+  const totalRows = folderCount + fileCount;
+  const totalPages = Math.max(1, Math.ceil(totalRows / pageSize) || 1);
+  const targetRaw = Number(targetPage);
+  const page = Number.isFinite(targetRaw)
+    ? Math.max(1, Math.min(totalPages, Math.floor(targetRaw)))
+    : 1;
+  const startRow = (page - 1) * pageSize;
+  const endRow = Math.min(totalRows, startRow + pageSize);
+
+  const folderStart = Math.min(folderCount, startRow);
+  const folderEnd = Math.min(folderCount, endRow);
+  const folderCountOnPage = Math.max(0, folderEnd - folderStart);
+
+  const fileStart = Math.max(0, startRow - folderCount);
+  const fileEnd = Math.max(0, endRow - folderCount);
+  const fileCountOnPage = Math.max(0, fileEnd - fileStart);
+
+  return {
+    page,
+    totalPages,
+    pageSize,
+    totalRows,
+    folderStart,
+    folderCount: folderCountOnPage,
+    fileStart,
+    fileCount: fileCountOnPage
+  };
+}
+
+function resolveServerPagingCursorForLoad({ pane, folder, sourceId, requestedCursor }) {
+  if (requestedCursor != null) {
+    return String(requestedCursor);
+  }
+  if (window.viewMode !== 'table' || window.showInlineFolders === false) {
+    return '';
+  }
+
+  const paneKey = normalizePaneKey(pane);
+  const state = getPaneState(paneKey);
+  const pageRaw = Number(state?.currentPage || window.currentPage || 1);
+  const targetPage = Number.isFinite(pageRaw) ? Math.max(1, Math.floor(pageRaw)) : 1;
+  if (targetPage <= 1) {
+    return '';
+  }
+
+  const subfolders = getSubfoldersForPagingContext(paneKey, folder, sourceId);
+  const totalFolders = Array.isArray(subfolders) ? subfolders.length : 0;
+  if (totalFolders <= 0) {
+    return '';
+  }
+  const pageSize = getFileListCursorPageSize();
+  const fileOffset = Math.max(0, ((targetPage - 1) * pageSize) - totalFolders);
+  return String(fileOffset);
 }
 
 let __frTreeSourceId = null;
@@ -1918,6 +2099,32 @@ function updateDualPaneTargetHint() {
   hint.textContent = `Target: ${sideLabel} -> ${folderLabel}`;
   hint.title = `Copy/move target is the ${sideLabel.toLowerCase()} pane folder.`;
   hint.style.display = 'inline-flex';
+}
+
+function syncFolderStripWithPaneState(paneKey) {
+  const strip = document.getElementById('folderStripContainer');
+  if (!strip) return;
+  if (!window.showFoldersInList) {
+    strip.innerHTML = '';
+    strip.style.display = 'none';
+    return;
+  }
+
+  const state = getPaneState(paneKey);
+  const sourceId = String((state && state.sourceId) || '');
+  const folder = String((state && state.currentFolder) || 'root');
+  const subfolders = Array.isArray(state?.currentSubfolders) ? state.currentSubfolders : [];
+  const subfoldersSourceId = String(state?.currentSubfoldersSourceId || '');
+  const subfoldersFolder = String(state?.currentSubfoldersFolder || '');
+  const matchesContext = subfoldersSourceId === sourceId && subfoldersFolder === folder;
+
+  if (!matchesContext || !subfolders.length) {
+    strip.innerHTML = '';
+    strip.style.display = 'none';
+    return;
+  }
+
+  renderFolderStripPaged(strip, subfolders, sourceId);
 }
 
 function updateInactivePanePlaceholder(inactiveKey) {
@@ -2186,6 +2393,7 @@ function setActivePane(pane, opts) {
   }
 
   syncGlobalsFromPaneState(next);
+  syncFolderStripWithPaneState(next);
   if (state.currentFolder) {
     updateBreadcrumbTitle(state.currentFolder);
     try { syncFolderTreeSelection(state.currentFolder); } catch (e) { /* ignore */ }
@@ -2282,9 +2490,19 @@ try {
     }
     savePaneState(activeKey, {
       sourceId: id,
+      currentSubfolders: [],
+      currentSubfoldersSourceId: '',
+      currentSubfoldersFolder: '',
       currentFolderCaps: null,
       selectedFolderCaps: null
     });
+    if (activeKey === normalizePaneKey(window.activePane)) {
+      const strip = document.getElementById('folderStripContainer');
+      if (strip) {
+        strip.innerHTML = '';
+        strip.style.display = 'none';
+      }
+    }
     const storedFolder = readStoredPaneFolder(activeKey, id) || getLastOpenedFolder(id) || 'root';
     savePaneState(activeKey, { currentFolder: storedFolder });
     const folder = storedFolder || state.currentFolder || 'root';
@@ -2477,62 +2695,46 @@ async function paneDropHandler(e) {
     }
 
     const sourceParent = dragData.sourceFolder || parentFolderOf(sourceFolder);
-    const progress = startTransferProgress({
-      action: 'Moving',
-      itemCount: 1,
-      itemLabel: 'folder',
-      bytesKnown: false,
-      indeterminate: true,
-      source: sourceFolder,
-      destination: targetFolder
-    });
-    let ok = false;
-    let errMsg = '';
-
     try {
-      const res = await fetch('/api/folder/moveFolder.php', {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-CSRF-Token': window.csrfToken
-        },
-        body: JSON.stringify({
+      await runTransferJob({
+        kind: 'folder_move',
+        payload: {
           source: sourceFolder,
           destination: targetFolder,
           sourceId,
           destSourceId
-        })
-      });
-      const data = await res.json().catch(() => ({}));
-      if (data && !data.error) {
-        ok = true;
-        const destLabel = targetFolder || t('root_folder');
-        showToast(t('move_folder_success_to', { folder: destLabel }), 'success');
-        if (crossSource) {
-          if (sourceParent) invalidateFolderStats([sourceParent], sourceId);
-          invalidateFolderStats([targetFolder], destSourceId);
-          loadFileList(targetFolder, { pane: paneKey }).finally(scheduleRepair);
-        } else {
-          const statSourceId = sourceId || destSourceId;
-          invalidateFolderStats([sourceParent, targetFolder], statSourceId);
-          await syncTreeAfterFolderMove(sourceFolder, targetFolder);
-          scheduleRepair();
+        },
+        progress: {
+          action: 'Moving',
+          itemCount: 1,
+          itemLabel: 'folder',
+          bytesKnown: false,
+          indeterminate: true,
+          source: sourceFolder,
+          destination: targetFolder
         }
-        markPaneNeedsReloadForFolder(sourceParent, sourceId);
-        pruneMovedFolderFromInactivePane(sourceFolder, sourceParent, sourceId);
+      });
+      showToast(buildMoveFolderSuccessToast(sourceFolder, targetFolder), 'success');
+      if (crossSource) {
+        if (sourceParent) invalidateFolderStats([sourceParent], sourceId);
+        invalidateFolderStats([targetFolder], destSourceId);
+        loadFileList(targetFolder, { pane: paneKey }).finally(scheduleRepair);
       } else {
-        ok = false;
-        errMsg = data && data.error ? data.error : t('move_folder_error_default');
-        showToast(t('move_folder_error_detail', { error: errMsg }), 'error');
+        const statSourceId = sourceId || destSourceId;
+        invalidateFolderStats([sourceParent, targetFolder], statSourceId);
+        await syncTreeAfterFolderMove(sourceFolder, targetFolder);
+        scheduleRepair();
       }
+      markPaneNeedsReloadForFolder(sourceParent, sourceId);
+      pruneMovedFolderFromInactivePane(sourceFolder, sourceParent, sourceId);
     } catch (err) {
-      ok = false;
-      errMsg = err && err.message ? err.message : t('move_folder_error_default');
+      if (err && err.cancelled) {
+        showToast(t('transfer_cancelled') || 'Transfer cancelled.', 'info');
+        return;
+      }
+      const errMsg = err && err.message ? err.message : t('move_folder_error_default');
       console.error('Error moving folder:', err);
-      showToast(t('move_folder_error'), 'error');
-    } finally {
-      finishTransferProgress(progress, { ok, error: errMsg });
+      showToast(t('move_folder_error_detail', { error: errMsg }), 'error');
     }
     return;
   }
@@ -2555,64 +2757,61 @@ async function paneDropHandler(e) {
     bytesKnown: dragData.bytesKnown === true,
     itemCount: files.length
   };
-  const progress = startTransferProgress({
-    action: 'Moving',
-    itemCount: totals.itemCount,
-    itemLabel: totals.itemCount === 1 ? 'file' : 'files',
-    totalBytes: totals.totalBytes,
-    bytesKnown: totals.bytesKnown,
-    source: sourceFolder,
-    destination: targetFolder
-  });
-  let ok = false;
-  let errMsg = '';
-
   try {
-    const res = await fetch('/api/file/moveFiles.php', {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-CSRF-Token': window.csrfToken
-      },
-      body: JSON.stringify({
+    await runTransferJob({
+      kind: 'file_move',
+      payload: {
         source: sourceFolder,
         files,
         destination: targetFolder,
         sourceId,
-        destSourceId
-      })
-    });
-    const data = await res.json().catch(() => ({}));
-    if (data.success) {
-      ok = true;
-      const destLabel = targetFolder || t('root_folder');
-      showToast(t('move_files_success_to', { count: files.length, folder: destLabel }), 'success');
-      if (crossSource) {
-        invalidateFolderStats([sourceFolder], sourceId);
-        invalidateFolderStats([targetFolder], destSourceId);
-      } else {
-        const statSourceId = sourceId || destSourceId;
-        invalidateFolderStats([sourceFolder, targetFolder], statSourceId);
+        destSourceId,
+        totalBytes: totals.totalBytes
+      },
+      progress: {
+        action: 'Moving',
+        itemCount: totals.itemCount,
+        itemLabel: totals.itemCount === 1 ? 'file' : 'files',
+        totalBytes: totals.totalBytes,
+        bytesKnown: totals.bytesKnown,
+        source: sourceFolder,
+        destination: targetFolder
       }
-      loadFileList(targetFolder, { pane: paneKey }).finally(scheduleRepair);
-      const activeSourceId = getGlobalActiveSourceId();
-      if (!destSourceId || destSourceId === activeSourceId) refreshFolderIcon(targetFolder);
-      if (!sourceId || sourceId === activeSourceId) refreshFolderIcon(sourceFolder);
-      markPaneNeedsReloadForFolder(sourceFolder, sourceId);
-      pruneMovedFilesFromInactivePane(sourceFolder, files, sourceId);
+    });
+    const destLabel = targetFolder || t('root_folder');
+    const movedNames = files.map(f => {
+      if (typeof f === 'string') return String(f || '').trim();
+      if (f && typeof f === 'object') {
+        return String(f.name || f.file || f.filename || f.fileName || '').trim();
+      }
+      return '';
+    }).filter(Boolean);
+    if (movedNames.length === 1) {
+      showToast(t('move_file_success_to', { name: movedNames[0], folder: destLabel }), 'success');
     } else {
-      ok = false;
-      errMsg = data.error || t('unknown_error');
-      showToast(t('move_files_error', { error: errMsg }), 'error');
+      showToast(t('move_files_success_to', { count: movedNames.length || files.length, folder: destLabel }), 'success');
     }
+    if (crossSource) {
+      invalidateFolderStats([sourceFolder], sourceId);
+      invalidateFolderStats([targetFolder], destSourceId);
+    } else {
+      const statSourceId = sourceId || destSourceId;
+      invalidateFolderStats([sourceFolder, targetFolder], statSourceId);
+    }
+    loadFileList(targetFolder, { pane: paneKey }).finally(scheduleRepair);
+    const activeSourceId = getGlobalActiveSourceId();
+    if (!destSourceId || destSourceId === activeSourceId) refreshFolderIcon(targetFolder);
+    if (!sourceId || sourceId === activeSourceId) refreshFolderIcon(sourceFolder);
+    markPaneNeedsReloadForFolder(sourceFolder, sourceId);
+    pruneMovedFilesFromInactivePane(sourceFolder, files, sourceId);
   } catch (err) {
-    ok = false;
-    errMsg = err && err.message ? err.message : t('unknown_error');
+    if (err && err.cancelled) {
+      showToast(t('transfer_cancelled') || 'Transfer cancelled.', 'info');
+      return;
+    }
+    const errMsg = err && err.message ? err.message : t('unknown_error');
     console.error('Error moving files:', err);
-    showToast(t('move_files_error_generic'), 'error');
-  } finally {
-    finishTransferProgress(progress, { ok, error: errMsg });
+    showToast(t('move_files_error', { error: errMsg }), 'error');
   }
 }
 
@@ -2767,12 +2966,25 @@ function handleFolderCheckboxChange(cb) {
   refreshSelectedFolderCaps(window.selectedInlineFolder);
 }
 
-function setCurrentFolderContext(folder) {
+function resetPagingForFolderNavigation(pane) {
+  const paneKey = normalizePaneKey(pane || window.activePane);
+  savePaneState(paneKey, { currentPage: 1 });
+  setPaneFileListPaging(paneKey, null);
+  if (paneKey === normalizePaneKey(window.activePane)) {
+    window.currentPage = 1;
+  }
+}
+
+function setCurrentFolderContext(folder, opts = {}) {
   if (!folder) return;
+  const pane = normalizePaneKey(opts.pane || window.activePane);
+  if (opts.resetPage === true) {
+    resetPagingForFolderNavigation(pane);
+  }
   window.currentFolder = folder;
-  setLastOpenedFolder(folder, getActivePaneSourceId());
+  setLastOpenedFolder(folder, getPaneSourceId(pane));
   updateBreadcrumbTitle(folder);
-  savePaneState(normalizePaneKey(window.activePane), { currentFolder: folder });
+  savePaneState(pane, { currentFolder: folder });
 }
 
 function clampRowHeight(v) {
@@ -4590,7 +4802,22 @@ function toggleAdvancedSearch() {
   if (advancedBtn) {
     advancedBtn.textContent = window.advancedSearchEnabled ? "Basic Search" : "Advanced Search";
   }
-  renderFileTable(window.currentFolder);
+  const pane = normalizePaneKey(window.activePane);
+  const folder = window.currentFolder || "root";
+  if (window.advancedSearchEnabled) {
+    loadFileList(folder, { pane, forceLegacy: true, includeContent: true });
+    return;
+  }
+  const trimmed = String(window.currentSearchTerm || '').trim();
+  if (trimmed === '' && shouldUseServerFilePagingForRequest({})) {
+    loadFileList(folder, { pane });
+    return;
+  }
+  if (window.viewMode === "gallery") {
+    renderGalleryView(folder);
+  } else {
+    renderFileTable(folder);
+  }
 }
 
 window.imageCache = window.imageCache || {};
@@ -5265,7 +5492,9 @@ async function navigateToSearchResult(folder, name, sourceId) {
       try { localStorage.setItem('fr_active_source', targetSourceId); } catch (e) { /* ignore */ }
     }
 
-    savePaneState(normalizePaneKey(window.activePane), {
+    const activePane = normalizePaneKey(window.activePane);
+    resetPagingForFolderNavigation(activePane);
+    savePaneState(activePane, {
       sourceId: targetSourceId,
       currentFolderCaps: null,
       selectedFolderCaps: null
@@ -5284,7 +5513,7 @@ async function navigateToSearchResult(folder, name, sourceId) {
   }
 
   pendingSearchSelection = targetName ? { folder: dest, name: targetName } : null;
-  setCurrentFolderContext(dest);
+  setCurrentFolderContext(dest, { resetPage: true });
 
   // Refresh tree + strip selections to match the jumped folder
   try {
@@ -5351,7 +5580,7 @@ function applyGalleryColumns(cols) {
 
   const grid = document.querySelector(".gallery-container");
   if (grid) {
-    grid.style.gridTemplateColumns = `repeat(${clamped},1fr)`;
+    grid.style.gridTemplateColumns = `repeat(${clamped},minmax(0,1fr))`;
   }
   document.querySelectorAll(".gallery-thumbnail")
     .forEach(img => img.style.maxHeight = getMaxImageHeight() + "px");
@@ -5703,6 +5932,16 @@ export async function loadFileList(folderParam, options = {}) {
   const { skipFallback } = options || {};
   const sourceParam = paneSourceId ? `&sourceId=${encodeURIComponent(paneSourceId)}` : '';
   const isFtp = isFtpSource(paneSourceId);
+  const shouldFetchFolders = window.showFoldersInList !== false || window.showInlineFolders !== false;
+  const includeContent = window.advancedSearchEnabled === true || options.includeContent === true;
+  const useServerPaging = shouldUseServerFilePagingForRequest(options);
+  let requestedCursor = (options && Object.prototype.hasOwnProperty.call(options, 'cursor'))
+    ? String(options.cursor || '')
+    : null;
+  const hadExplicitFolderParam = folderParam !== undefined && folderParam !== null && String(folderParam).trim() !== '';
+  const prevPaneFolder = (paneState && typeof paneState.currentFolder === 'string')
+    ? paneState.currentFolder.trim()
+    : '';
 
   let folder = folderParam || paneFolder || lastOpenedFolder || (paneSourceId ? "root" : (window.currentFolder || "root"));
   const isActivePane = pane === normalizePaneKey(window.activePane);
@@ -5715,6 +5954,14 @@ export async function loadFileList(folderParam, options = {}) {
     window.currentFolder = folder;
     setLastOpenedFolder(folder, paneSourceId);
     updateBreadcrumbTitle(folder);
+  }
+  const prevFolderKey = normalizeFolderPath(prevPaneFolder || paneFolder || '');
+  const nextFolderKey = normalizeFolderPath(folder || '');
+  const folderChangedByExplicitLoad = hadExplicitFolderParam && prevFolderKey !== nextFolderKey;
+  if (folderChangedByExplicitLoad) {
+    resetPagingForFolderNavigation(pane);
+    // Ignore any stale cursor when changing folders through a direct load call.
+    requestedCursor = null;
   }
   savePaneState(pane, { currentFolder: folder });
   const subfoldersMatch =
@@ -5744,6 +5991,9 @@ export async function loadFileList(folderParam, options = {}) {
   window.selectedFolderCaps = null;
   savePaneState(pane, { selectedFolderCaps: null });
   refreshCurrentFolderCaps(folder, paneSourceId, pane);
+  if (!useServerPaging) {
+    setPaneFileListPaging(pane, null);
+  }
 
   // 1) show loader (only this request is allowed to render)
   fileListContainer.style.visibility = "visible";
@@ -5751,19 +6001,55 @@ export async function loadFileList(folderParam, options = {}) {
   fileListContainer.innerHTML = "<div class='loader'>Loading files...</div>";
   const slowToastTimer = setTimeout(() => {
     if (reqId === __fileListReqSeq[pane]) {
-      showToast(t('loading_slow') || "Still loading... remote sources can take a while.", 'info');
+      const now = Date.now();
+      if ((now - _lastSlowLoadToastAt) >= SLOW_LOAD_TOAST_COOLDOWN_MS) {
+        _lastSlowLoadToastAt = now;
+        showToast(t('loading_slow') || "Still loading... remote sources can take a while.", 'info');
+      }
     }
-  }, 8000);
+  }, SLOW_LOAD_TOAST_DELAY_MS);
 
   try {
     // Kick off both in parallel, but render as soon as FILES are ready
     const recursiveParam = folderOnly ? 0 : 1;
-    const filesPromise = fetch(
-      withBase(`/api/file/getFileList.php?folder=${encodeURIComponent(folder)}&recursive=${recursiveParam}${sourceParam}&t=${Date.now()}`),
-      { credentials: 'include' }
-    );
+    const buildFileListUrl = (targetFolder, recursiveValue, cursorValue = null, forceNoPaging = false) => {
+      const params = new URLSearchParams();
+      params.set('folder', targetFolder);
+      params.set('recursive', String(recursiveValue));
+      if (paneSourceId) {
+        params.set('sourceId', paneSourceId);
+      }
+      if (includeContent) {
+        params.set('includeContent', '1');
+      }
+      if (!forceNoPaging && useServerPaging) {
+        const pageSize = getFileListCursorPageSize();
+        const sortColumn = String(sortOrder?.column || 'modified');
+        const sortDir = (sortOrder && sortOrder.ascending === true) ? 'asc' : 'desc';
+        const allowedSort = new Set(['name', 'modified', 'uploaded', 'size', 'uploader']);
+        params.set('pageSize', String(pageSize));
+        params.set('sortBy', allowedSort.has(sortColumn) ? sortColumn : 'modified');
+        params.set('sortDir', sortDir);
+        const cursorText = (cursorValue == null) ? '' : String(cursorValue).trim();
+        if (cursorText !== '') {
+          params.set('cursor', cursorText);
+        }
+      }
+      params.set('t', String(Date.now()));
+      return withBase(`/api/file/getFileList.php?${params.toString()}`);
+    };
+
+    const startCursor = useServerPaging
+      ? resolveServerPagingCursorForLoad({
+          pane,
+          folder,
+          sourceId: paneSourceId,
+          requestedCursor
+        })
+      : null;
+    const filesPromise = fetch(buildFileListUrl(folder, recursiveParam, startCursor), { credentials: 'include' });
     let foldersPromise = null;
-    if (!isFtp) {
+    if (!isFtp && shouldFetchFolders) {
       foldersPromise = fetch(
         withBase(`/api/folder/getFolderList.php?folder=${encodeURIComponent(folder)}&counts=0${sourceParam}`),
         { credentials: 'include' }
@@ -5780,7 +6066,7 @@ export async function loadFileList(folderParam, options = {}) {
     if (filesRes.status === 403 && folder !== "root") {
       try {
         filesRes = await fetch(
-          withBase(`/api/file/getFileList.php?folder=${encodeURIComponent(folder)}&recursive=0${sourceParam}&t=${Date.now()}`),
+          buildFileListUrl(folder, 0, startCursor),
           { credentials: "include" }
         );
       } catch (e) { /* ignore and fall through */ }
@@ -5788,7 +6074,7 @@ export async function loadFileList(folderParam, options = {}) {
     if (filesRes.status === 403 && username && folder !== username) {
       try {
         const alt = await fetch(
-          withBase(`/api/file/getFileList.php?folder=${encodeURIComponent(username)}&recursive=0${sourceParam}&t=${Date.now()}`),
+          buildFileListUrl(username, 0, useServerPaging ? '' : null),
           { credentials: "include" }
         );
         if (alt.ok) {
@@ -5803,7 +6089,7 @@ export async function loadFileList(folderParam, options = {}) {
           try { localStorage.setItem("folderOnly", "true"); } catch (e) { }
           refreshCurrentFolderCaps(folder, paneSourceId, pane);
           // refresh folders promise for the new folder context
-          if (!isFtp) {
+          if (!isFtp && shouldFetchFolders) {
             foldersPromise = fetch(
               withBase(`/api/folder/getFolderList.php?folder=${encodeURIComponent(folder)}&counts=0${sourceParam}`),
               { credentials: 'include' }
@@ -5822,8 +6108,8 @@ export async function loadFileList(folderParam, options = {}) {
       if (!skipFallback) {
         const fallback = await findBestAccessibleFolder({ lastOpenedFolder, sourceId: paneSourceId });
         if (fallback && fallback !== folder) {
-          setCurrentFolderContext(fallback);
-          return await loadFileList(fallback, { skipFallback: true });
+          setCurrentFolderContext(fallback, { pane, resetPage: true });
+          return await loadFileList(fallback, { pane, skipFallback: true, forceLegacy: options.forceLegacy === true });
         }
       }
       // For folder-only users, treat 403 as "empty list" instead of hard error.
@@ -5858,6 +6144,36 @@ export async function loadFileList(folderParam, options = {}) {
     if (!paneSourceId && responseSourceId) {
       paneSourceId = responseSourceId;
       savePaneState(pane, { sourceId: responseSourceId });
+    }
+    const pagingRaw = (data && typeof data.paging === 'object' && data.paging) ? data.paging : null;
+    if (useServerPaging && pagingRaw) {
+      const limit = Number.isFinite(Number(pagingRaw.limit))
+        ? Math.max(FILE_LIST_CURSOR_PAGE_SIZE_MIN, Math.min(FILE_LIST_CURSOR_PAGE_SIZE_MAX, Number(pagingRaw.limit)))
+        : getFileListCursorPageSize();
+      const total = Number.isFinite(Number(pagingRaw.total)) ? Math.max(0, Number(pagingRaw.total)) : 0;
+      const totalPagesRaw = Number.isFinite(Number(pagingRaw.totalPages)) ? Number(pagingRaw.totalPages) : 0;
+      const totalPages = Math.max(1, totalPagesRaw || Math.ceil(total / limit) || 1);
+      const pageRaw = Number.isFinite(Number(pagingRaw.page)) ? Number(pagingRaw.page) : 1;
+      const page = Math.max(1, Math.min(totalPages, pageRaw || 1));
+      const nextCursor = (pagingRaw.nextCursor == null) ? null : String(pagingRaw.nextCursor);
+      const prevCursor = (pagingRaw.prevCursor == null) ? null : String(pagingRaw.prevCursor);
+      const cursor = String(pagingRaw.cursor == null ? '' : pagingRaw.cursor);
+      setPaneFileListPaging(pane, {
+        enabled: true,
+        mode: 'cursor',
+        cursor,
+        nextCursor,
+        prevCursor,
+        hasMore: !!pagingRaw.hasMore,
+        limit,
+        total,
+        totalPages,
+        page,
+        sortBy: String(pagingRaw.sortBy || sortOrder?.column || 'modified'),
+        sortDir: String(pagingRaw.sortDir || ((sortOrder && sortOrder.ascending === true) ? 'asc' : 'desc'))
+      });
+    } else {
+      setPaneFileListPaging(pane, null);
     }
 
     // If another loadFileList ran after this one, bail before touching the DOM
@@ -5985,18 +6301,15 @@ export async function loadFileList(folderParam, options = {}) {
 
     // ----- FOLDERS NEXT (populate strip when ready; doesn't block rows) -----
     try {
-      if (!foldersPromise && isFtp) {
-        const shouldFetchFolders = window.showFoldersInList !== false || window.showInlineFolders !== false;
-        if (shouldFetchFolders) {
-          foldersPromise = new Promise(resolve => {
-            setTimeout(() => {
-              resolve(fetch(
-                withBase(`/api/folder/getFolderList.php?folder=${encodeURIComponent(folder)}&counts=0${sourceParam}`),
-                { credentials: 'include' }
-              ));
-            }, 600);
-          });
-        }
+      if (!foldersPromise && isFtp && shouldFetchFolders) {
+        foldersPromise = new Promise(resolve => {
+          setTimeout(() => {
+            resolve(fetch(
+              withBase(`/api/folder/getFolderList.php?folder=${encodeURIComponent(folder)}&counts=0${sourceParam}`),
+              { credentials: 'include' }
+            ));
+          }, 600);
+        });
       }
 
       if (foldersPromise) {
@@ -6056,7 +6369,7 @@ export async function loadFileList(folderParam, options = {}) {
         renderFolderStripPaged(strip, subfolders, paneSourceId);
 
         // Re-render table view once folders are known so they appear inline above files
-        if (window.viewMode === "table" && reqId === __fileListReqSeq[pane]) {
+        if (window.viewMode === "table" && window.showInlineFolders !== false && reqId === __fileListReqSeq[pane]) {
           renderFileTable(folder, fileListContainer, undefined, { preserveSelection: true });
         }
       }
@@ -6080,13 +6393,11 @@ export async function loadFileList(folderParam, options = {}) {
     if (missingFolder && !skipFallback) {
       const fallback = getParentFolder(folder || 'root') || 'root';
       if (fallback && fallback !== folder) {
-        setLastOpenedFolder(fallback, paneSourceId);
+        setCurrentFolderContext(fallback, { pane, resetPage: true });
         if (isActivePane) {
-          window.currentFolder = fallback;
-          updateBreadcrumbTitle(fallback);
           try { syncFolderTreeSelection(fallback); } catch (e) { /* ignore */ }
         }
-        return await loadFileList(fallback, { pane, skipFallback: true });
+        return await loadFileList(fallback, { pane, skipFallback: true, forceLegacy: options.forceLegacy === true });
       }
     }
     console.error("Error loading file list:", err);
@@ -6388,7 +6699,8 @@ if (headerClass) {
       if (e.button !== 0) return;
       const dest = sf.full;
       if (!dest) return;
-      setCurrentFolderContext(dest);
+      const paneForRow = getPaneKeyForElement(tr);
+      setCurrentFolderContext(dest, { resetPage: true, pane: paneForRow });
     
       document.querySelectorAll(".folder-option.selected")
         .forEach(o => o.classList.remove("selected"));
@@ -6407,7 +6719,7 @@ if (headerClass) {
         if (stripItem) stripItem.classList.add("selected");
       }
     
-      loadFileList(dest);
+      loadFileList(dest, { pane: paneForRow });
     });
   
     
@@ -6429,12 +6741,20 @@ if (headerClass) {
   
     const rowSourceId = getActivePaneSourceId();
 
-    tr.addEventListener("contextmenu", e => {
+    tr.addEventListener("contextmenu", async e => {
       e.preventDefault();
       e.stopPropagation();
   
       const dest = sf.full;
       if (!dest) return;
+
+      let caps = null;
+      try {
+        caps = await fetchFolderCaps(dest, rowSourceId);
+      } catch (e2) { /* ignore */ }
+      const enc = (caps && caps.encryption) ? caps.encryption : {};
+      const canEncrypt = !!enc.canEncrypt;
+      const canDecrypt = !!enc.canDecrypt;
   
       const menuItems = [
         {
@@ -6450,6 +6770,16 @@ if (headerClass) {
         { label: t("move_folder"),   action: () => openMoveFolderUI(dest) },
         { label: t("rename_folder"), action: () => startInlineRenameForFolderRow(tr, dest) },
         { label: t("color_folder"),  action: () => openColorFolderModal(dest) },
+        ...(canEncrypt ? [{
+          label: 'Encrypt folder',
+          icon: 'lock',
+          action: () => startFolderCryptoJobFlow(dest, 'encrypt')
+        }] : []),
+        ...(canDecrypt ? [{
+          label: 'Decrypt folder',
+          icon: 'lock_open',
+          action: () => startFolderCryptoJobFlow(dest, 'decrypt')
+        }] : []),
         { label: t("folder_share"),  action: () => openFolderShareModal(dest) },
         { label: t("delete_folder"), action: () => { window.currentFolder = dest; openDeleteFolderModal(); } }
       ];
@@ -6837,7 +7167,12 @@ export async function renderFileTable(folder, container, subfolders, options = {
   let preservedSelection = [];
   const searchTerm = (window.currentSearchTerm || "").toLowerCase();
   const itemsPerPageSetting = parseInt(localStorage.getItem("itemsPerPage") || "50", 10);
-  let currentPage = window.currentPage || 1;
+  const tablePane = getPaneKeyForElement(fileListContent);
+  const panePaging = getPaneFileListPaging(tablePane);
+  const serverPagingActive = !!(panePaging && searchTerm === "" && !window.advancedSearchEnabled);
+  let currentPage = serverPagingActive
+    ? (Number(panePaging.page) || 1)
+    : (window.currentPage || 1);
   const targetSelection = (pendingSearchSelection && pendingSearchSelection.folder === folder)
     ? pendingSearchSelection
     : null;
@@ -6846,7 +7181,7 @@ export async function renderFileTable(folder, container, subfolders, options = {
   let filteredFiles = searchFiles(searchTerm);
 
   // Apply current sort (Modified desc by default for you)
-  if (Array.isArray(filteredFiles) && filteredFiles.length) {
+  if (!serverPagingActive && Array.isArray(filteredFiles) && filteredFiles.length) {
     filteredFiles = [...filteredFiles].sort(compareFilesForSort);
   }
 
@@ -6871,52 +7206,118 @@ const subfoldersSorted = await sortSubfoldersForCurrentOrder(allSubfolders);
   const totalFolders = subfoldersSorted.length;
   const totalRows    = totalFiles + totalFolders;
   const hasFolders   = totalFolders > 0;
+  const folderPagingInServerMode =
+    serverPagingActive &&
+    window.showInlineFolders !== false &&
+    hasFolders;
+  let totalPages = 1;
+  let pageFolders = [];
+  let pageFiles = [];
 
-  // If we have a pending search target, jump to the page that contains it
-  if (targetSelection && totalFiles > 0) {
-    const idx = filteredFiles.findIndex(f => f.name === targetSelection.name);
-    if (idx >= 0) {
-      const targetPage = Math.floor(idx / itemsPerPageSetting) + 1;
-      if (targetPage !== currentPage) {
-        currentPage = targetPage;
-        window.currentPage = currentPage;
+  if (serverPagingActive) {
+    const totalFilesKnown = Number.isFinite(Number(panePaging.total))
+      ? Math.max(0, Number(panePaging.total))
+      : Math.max(0, totalFiles);
+
+    if (folderPagingInServerMode) {
+      const currentCursor = String((panePaging && panePaging.cursor != null) ? panePaging.cursor : '');
+      const cursorOffset = parseCursorOffset(currentCursor);
+      const inferredPage = Math.floor((totalFolders + cursorOffset) / itemsPerPageSetting) + 1;
+      const preferredPageRaw = Number(window.currentPage || inferredPage);
+      const preferredPage = Number.isFinite(preferredPageRaw) ? preferredPageRaw : inferredPage;
+      const layout = getCombinedPageLayout({
+        totalFolders,
+        totalFiles: totalFilesKnown,
+        itemsPerPage: itemsPerPageSetting,
+        targetPage: preferredPage
+      });
+
+      totalPages = layout.totalPages;
+      currentPage = layout.page;
+      pageFolders = subfoldersSorted.slice(layout.folderStart, layout.folderStart + layout.folderCount);
+
+      if (layout.fileCount > 0) {
+        const loadedCount = Math.max(0, Array.isArray(filteredFiles) ? filteredFiles.length : 0);
+        const rangeStart = layout.fileStart;
+        const rangeEnd = layout.fileStart + layout.fileCount;
+        const loadedEnd = cursorOffset + loadedCount;
+        const hasRange = cursorOffset <= rangeStart && loadedEnd >= rangeEnd;
+
+        if (!hasRange) {
+          const targetCursor = String(rangeStart);
+          if (targetCursor !== currentCursor) {
+            window.currentPage = currentPage;
+            savePaneState(tablePane, {
+              currentPage,
+              currentSearchTerm: window.currentSearchTerm || ''
+            });
+            loadFileList(folder, { pane: tablePane, cursor: targetCursor });
+            return;
+          }
+        }
+
+        const localStart = Math.max(0, rangeStart - cursorOffset);
+        pageFiles = filteredFiles.slice(localStart, localStart + layout.fileCount);
+      } else {
+        pageFiles = [];
+      }
+    } else {
+      const pagingTotalPages = Number.isFinite(Number(panePaging.totalPages)) ? Number(panePaging.totalPages) : 1;
+      const pagingPage = Number.isFinite(Number(panePaging.page)) ? Number(panePaging.page) : currentPage;
+      const fileTotalPages = Math.max(1, pagingTotalPages || (panePaging.hasMore ? pagingPage + 1 : pagingPage) || 1);
+      const filePage = Math.max(1, Math.min(fileTotalPages, pagingPage || 1));
+      totalPages = fileTotalPages;
+      currentPage = Math.max(1, Math.min(totalPages, filePage || 1));
+      // Legacy server-paging behavior: keep folders visible above each file page.
+      pageFolders = subfoldersSorted;
+      pageFiles = filteredFiles;
+    }
+
+    window.currentPage = currentPage;
+  } else {
+    // If we have a pending search target, jump to the page that contains it
+    if (targetSelection && totalFiles > 0) {
+      const idx = filteredFiles.findIndex(f => f.name === targetSelection.name);
+      if (idx >= 0) {
+        const targetPage = Math.floor(idx / itemsPerPageSetting) + 1;
+        if (targetPage !== currentPage) {
+          currentPage = targetPage;
+          window.currentPage = currentPage;
+        }
+      }
+    }
+
+    // Pagination is now over (folders + files)
+    totalPages = totalRows > 0
+      ? Math.ceil(totalRows / itemsPerPageSetting)
+      : 1;
+
+    if (currentPage > totalPages) {
+      currentPage = totalPages;
+      window.currentPage = currentPage;
+    }
+
+    const startRow = (currentPage - 1) * itemsPerPageSetting;
+    const endRow = Math.min(startRow + itemsPerPageSetting, totalRows);
+
+    // Figure out which folders + files belong to THIS page
+    for (let rowIndex = startRow; rowIndex < endRow; rowIndex++) {
+      if (rowIndex < totalFolders) {
+        pageFolders.push(subfoldersSorted[rowIndex]);
+      } else {
+        const fileIdx = rowIndex - totalFolders;
+        const file = filteredFiles[fileIdx];
+        if (file) pageFiles.push(file);
       }
     }
   }
 
-  // Pagination is now over (folders + files)
-  const totalPages = totalRows > 0
-    ? Math.ceil(totalRows / itemsPerPageSetting)
-    : 1;
-
-  if (currentPage > totalPages) {
-    currentPage = totalPages;
-    window.currentPage = currentPage;
-  }
   // Keep pane-local pagination state in sync so click-capture pane activation
   // does not restore a stale page before pagination handlers run.
-  const tablePane = getPaneKeyForElement(fileListContent);
   savePaneState(tablePane, {
     currentPage,
     currentSearchTerm: window.currentSearchTerm || ''
   });
-
-  const startRow = (currentPage - 1) * itemsPerPageSetting;
-  const endRow   = Math.min(startRow + itemsPerPageSetting, totalRows);
-
-  // Figure out which folders + files belong to THIS page
-  const pageFolders = [];
-  const pageFiles   = [];
-
-  for (let rowIndex = startRow; rowIndex < endRow; rowIndex++) {
-    if (rowIndex < totalFolders) {
-      pageFolders.push(subfoldersSorted[rowIndex]);
-    } else {
-      const fileIdx = rowIndex - totalFolders;
-      const file = filteredFiles[fileIdx];
-      if (file) pageFiles.push(file);
-    }
-  }
 
   // Stable id per file row on this page
   const rowIdFor = (file, idx) =>
@@ -7184,12 +7585,72 @@ wireSelectAll(fileListContent);
     }
 
   fileListContent.querySelectorAll('.folder-item').forEach(el => {
-    el.addEventListener('click', () => loadFileList(el.dataset.folder));
+    el.addEventListener('click', () => {
+      const dest = String(el.dataset.folder || '').trim();
+      if (!dest) return;
+      setCurrentFolderContext(dest, { pane: tablePane, resetPage: true });
+      loadFileList(dest, { pane: tablePane });
+    });
   });
+
+  const goToCombinedServerPage = (targetPage) => {
+    const totalFilesKnown = Number.isFinite(Number(panePaging?.total))
+      ? Math.max(0, Number(panePaging.total))
+      : Math.max(0, totalFiles);
+    const layout = getCombinedPageLayout({
+      totalFolders,
+      totalFiles: totalFilesKnown,
+      itemsPerPage: itemsPerPageSetting,
+      targetPage
+    });
+
+    window.currentPage = layout.page;
+    savePaneState(tablePane, {
+      currentPage: window.currentPage,
+      currentSearchTerm: window.currentSearchTerm || ''
+    });
+
+    if (layout.fileCount <= 0) {
+      renderFileTable(folder, fileListContent);
+      return;
+    }
+
+    const targetCursor = String(layout.fileStart);
+    const currentCursor = String((panePaging && panePaging.cursor != null) ? panePaging.cursor : '');
+    const cursorOffset = parseCursorOffset(currentCursor);
+    const loadedCount = Math.max(0, Array.isArray(filteredFiles) ? filteredFiles.length : 0);
+    const loadedEnd = cursorOffset + loadedCount;
+    const requiredEnd = layout.fileStart + layout.fileCount;
+    const hasRange = cursorOffset <= layout.fileStart && loadedEnd >= requiredEnd;
+
+    if (currentCursor === targetCursor && hasRange) {
+      renderFileTable(folder, fileListContent);
+      return;
+    }
+
+    loadFileList(folder, { pane: tablePane, cursor: targetCursor });
+  };
 
   // pagination clicks
   const prevBtn = document.getElementById("prevPageBtn");
   if (prevBtn) prevBtn.addEventListener("click", () => {
+    if (serverPagingActive) {
+      if (folderPagingInServerMode) {
+        const virtualPage = Math.max(1, Number(window.currentPage || currentPage || 1));
+        if (virtualPage > 1) {
+          goToCombinedServerPage(virtualPage - 1);
+        }
+        return;
+      }
+
+      const prevCursor = panePaging && panePaging.prevCursor != null
+        ? String(panePaging.prevCursor)
+        : '';
+      if (prevCursor !== '') {
+        loadFileList(folder, { pane: tablePane, cursor: prevCursor });
+      }
+      return;
+    }
     if (window.currentPage > 1) {
       window.currentPage--;
       renderFileTable(folder, container);
@@ -7197,6 +7658,23 @@ wireSelectAll(fileListContent);
   });
   const nextBtn = document.getElementById("nextPageBtn");
   if (nextBtn) nextBtn.addEventListener("click", () => {
+    if (serverPagingActive) {
+      if (folderPagingInServerMode) {
+        const virtualPage = Math.max(1, Number(window.currentPage || currentPage || 1));
+        if (virtualPage < totalPages) {
+          goToCombinedServerPage(virtualPage + 1);
+        }
+        return;
+      }
+
+      const nextCursor = panePaging && panePaging.nextCursor != null
+        ? String(panePaging.nextCursor)
+        : '';
+      if (nextCursor !== '') {
+        loadFileList(folder, { pane: tablePane, cursor: nextCursor });
+      }
+      return;
+    }
     if (window.currentPage < totalPages) {
       window.currentPage++;
       renderFileTable(folder, container);
@@ -7215,6 +7693,10 @@ wireSelectAll(fileListContent);
     window.itemsPerPage = parseInt(e.target.value, 10);
     localStorage.setItem("itemsPerPage", window.itemsPerPage);
     window.currentPage = 1;
+    if (serverPagingActive) {
+      loadFileList(folder, { pane: tablePane, cursor: "" });
+      return;
+    }
     renderFileTable(folder, container);
   });
 
@@ -7278,6 +7760,20 @@ wireSelectAll(fileListContent);
     newSearchInput.addEventListener("input", debounce(function () {
       window.currentSearchTerm = newSearchInput.value;
       window.currentPage = 1;
+      savePaneState(tablePane, {
+        currentSearchTerm: window.currentSearchTerm || '',
+        currentPage: window.currentPage || 1
+      });
+      const livePaging = getPaneFileListPaging(tablePane);
+      const trimmed = String(window.currentSearchTerm || '').trim();
+      if (livePaging && trimmed !== '') {
+        loadFileList(folder, { pane: tablePane, forceLegacy: true, includeContent: window.advancedSearchEnabled === true });
+        return;
+      }
+      if (!livePaging && trimmed === '' && shouldUseServerFilePagingForRequest({})) {
+        loadFileList(folder, { pane: tablePane });
+        return;
+      }
       renderFileTable(folder, container);
       setTimeout(() => {
         const freshInput = document.getElementById("searchInput");
@@ -7347,25 +7843,34 @@ function getMaxImageHeight() {
 export function renderGalleryView(folder, container) {
   clearInlineRenameState({ restore: false });
   const fileListContent = container || document.getElementById("fileList");
+  const galleryPane = getPaneKeyForElement(fileListContent);
+  const panePaging = getPaneFileListPaging(galleryPane);
   const paneSourceId = String(getPaneSourceIdForElement(fileListContent) || getActivePaneSourceId() || '');
   const searchTerm = (window.currentSearchTerm || "").toLowerCase();
+  const serverPagingActive = !!(panePaging && searchTerm === "" && !window.advancedSearchEnabled);
   let filteredFiles = searchFiles(searchTerm);
 
-  if (Array.isArray(filteredFiles) && filteredFiles.length) {
+  if (!serverPagingActive && Array.isArray(filteredFiles) && filteredFiles.length) {
     filteredFiles = [...filteredFiles].sort(compareFilesForSort);
   }
 
   // pagination settings
   const itemsPerPage = window.itemsPerPage;
-  let currentPage = window.currentPage || 1;
+  let currentPage = serverPagingActive
+    ? (Number(panePaging.page) || 1)
+    : (window.currentPage || 1);
   const totalFiles = filteredFiles.length;
-  const totalPages = Math.ceil(totalFiles / itemsPerPage);
-  if (currentPage > totalPages) {
+  let totalPages = Math.ceil(totalFiles / itemsPerPage);
+  if (serverPagingActive) {
+    const pagingTotalPages = Number.isFinite(Number(panePaging.totalPages)) ? Number(panePaging.totalPages) : 1;
+    totalPages = Math.max(1, pagingTotalPages || totalPages || 1);
+    currentPage = Math.max(1, Math.min(totalPages, Number(panePaging.page) || currentPage));
+    window.currentPage = currentPage;
+  } else if (currentPage > totalPages) {
     currentPage = totalPages || 1;
     window.currentPage = currentPage;
   }
   // Keep pane-local pagination state in sync for gallery mode as well.
-  const galleryPane = getPaneKeyForElement(fileListContent);
   savePaneState(galleryPane, {
     currentPage,
     currentSearchTerm: window.currentSearchTerm || ''
@@ -7385,6 +7890,20 @@ export function renderGalleryView(folder, container) {
       searchInput.addEventListener("input", debounce(() => {
         window.currentSearchTerm = searchInput.value;
         window.currentPage = 1;
+        savePaneState(galleryPane, {
+          currentSearchTerm: window.currentSearchTerm || '',
+          currentPage: window.currentPage || 1
+        });
+        const livePaging = getPaneFileListPaging(galleryPane);
+        const trimmed = String(window.currentSearchTerm || '').trim();
+        if (livePaging && trimmed !== '') {
+          loadFileList(folder, { pane: galleryPane, forceLegacy: true, includeContent: window.advancedSearchEnabled === true });
+          return;
+        }
+        if (!livePaging && trimmed === '' && shouldUseServerFilePagingForRequest({})) {
+          loadFileList(folder, { pane: galleryPane });
+          return;
+        }
         renderGalleryView(folder);
         setTimeout(() => {
           const f = document.getElementById("searchInput");
@@ -7407,14 +7926,16 @@ export function renderGalleryView(folder, container) {
   galleryHTML += `
       <div class="gallery-container"
            style="display:grid;
-                  grid-template-columns:repeat(${startCols},1fr);
+                  grid-template-columns:repeat(${startCols},minmax(0,1fr));
                   gap:10px;
                   padding:10px;">
     `;
 
   // slice current page
-  const startIdx = (currentPage - 1) * itemsPerPage;
-  const pageFiles = filteredFiles.slice(startIdx, startIdx + itemsPerPage);
+  const startIdx = serverPagingActive ? 0 : (currentPage - 1) * itemsPerPage;
+  const pageFiles = serverPagingActive
+    ? filteredFiles
+    : filteredFiles.slice(startIdx, startIdx + itemsPerPage);
   const maxImagePreviewBytes = getMaxImagePreviewBytes();
   const maxVideoPreviewBytes = getMaxVideoPreviewBytes();
 
@@ -7542,7 +8063,7 @@ export function renderGalleryView(folder, container) {
     galleryHTML += `
         <div class="gallery-card"
              data-file-name="${escapeHTML(file.name)}"
-             style="position:relative; border-radius: 12px; border:1px solid #ccc; padding:5px; text-align:center;">
+             style="position:relative; border-radius:12px; border:1px solid #ccc; padding:5px; text-align:center; width:100%; min-width:0; box-sizing:border-box;">
           <input type="checkbox"
                  class="file-checkbox"
                  id="cb-${idSafe}"
@@ -7557,9 +8078,9 @@ export function renderGalleryView(folder, container) {
             ${thumbnail}
           </div>
   
-          <div class="gallery-info" style="margin-top:5px;">
+          <div class="gallery-info" style="margin-top:5px; min-width:0;">
             <span class="gallery-file-name"
-                  style="display:block; white-space:normal; overflow-wrap:break-word;">
+                  style="display:block; max-width:100%; white-space:normal; overflow-wrap:anywhere; word-break:break-word;">
               ${escapeHTML(file.name)}
             </span>
             ${sizeHTML}
@@ -7624,6 +8145,15 @@ export function renderGalleryView(folder, container) {
   // pagination buttons for gallery
   const prevBtn = document.getElementById("prevPageBtn");
   if (prevBtn) prevBtn.addEventListener("click", () => {
+    if (serverPagingActive) {
+      const prevCursor = panePaging && panePaging.prevCursor != null
+        ? String(panePaging.prevCursor)
+        : '';
+      if (prevCursor !== '') {
+        loadFileList(folder, { pane: galleryPane, cursor: prevCursor });
+      }
+      return;
+    }
     if (window.currentPage > 1) {
       window.currentPage--;
       renderGalleryView(folder, container);
@@ -7631,6 +8161,15 @@ export function renderGalleryView(folder, container) {
   });
   const nextBtn = document.getElementById("nextPageBtn");
   if (nextBtn) nextBtn.addEventListener("click", () => {
+    if (serverPagingActive) {
+      const nextCursor = panePaging && panePaging.nextCursor != null
+        ? String(panePaging.nextCursor)
+        : '';
+      if (nextCursor !== '') {
+        loadFileList(folder, { pane: galleryPane, cursor: nextCursor });
+      }
+      return;
+    }
     if (window.currentPage < totalPages) {
       window.currentPage++;
       renderGalleryView(folder, container);
@@ -7652,6 +8191,10 @@ export function renderGalleryView(folder, container) {
     window.itemsPerPage = parseInt(e.target.value, 10);
     localStorage.setItem("itemsPerPage", window.itemsPerPage);
     window.currentPage = 1;
+    if (serverPagingActive) {
+      loadFileList(folder, { pane: galleryPane, cursor: "" });
+      return;
+    }
     renderGalleryView(folder, container);
   });
 
@@ -7725,6 +8268,21 @@ export function renderGalleryView(folder, container) {
 
   // pagination helpers
   window.changePage = newPage => {
+    if (serverPagingActive) {
+      const target = parseInt(newPage, 10);
+      if (target === currentPage - 1 && panePaging && panePaging.prevCursor != null) {
+        const prevCursor = String(panePaging.prevCursor);
+        if (prevCursor !== '') {
+          loadFileList(folder, { pane: galleryPane, cursor: prevCursor });
+        }
+      } else if (target === currentPage + 1 && panePaging && panePaging.nextCursor != null) {
+        const nextCursor = String(panePaging.nextCursor);
+        if (nextCursor !== '') {
+          loadFileList(folder, { pane: galleryPane, cursor: nextCursor });
+        }
+      }
+      return;
+    }
     window.currentPage = newPage;
     if (window.viewMode === "gallery") renderGalleryView(folder);
     else renderFileTable(folder);
@@ -7734,6 +8292,10 @@ export function renderGalleryView(folder, container) {
     window.itemsPerPage = +cnt;
     localStorage.setItem("itemsPerPage", cnt);
     window.currentPage = 1;
+    if (serverPagingActive) {
+      loadFileList(folder, { pane: galleryPane, cursor: "" });
+      return;
+    }
     if (window.viewMode === "gallery") renderGalleryView(folder);
     else renderFileTable(folder);
   };
@@ -7913,6 +8475,16 @@ export function sortFiles(column, folder) {
     sortOrder.ascending = true;
   }
 
+  const pane = normalizePaneKey(window.activePane);
+  const paging = getPaneFileListPaging(pane);
+  const hasSearch = String(window.currentSearchTerm || '').trim() !== '';
+  if (paging && !hasSearch && !window.advancedSearchEnabled) {
+    window.currentPage = 1;
+    savePaneState(pane, { currentPage: 1 });
+    loadFileList(folder || window.currentFolder || 'root', { pane, cursor: '' });
+    return;
+  }
+
   // Re-sort master fileData
   fileData.sort(compareFilesForSort);
 
@@ -7994,6 +8566,68 @@ export function canEditFile(fileName) {
 
 // Expose global functions for pagination and preview.
 window.changePage = function (newPage) {
+  const pane = normalizePaneKey(window.activePane);
+  const paging = getPaneFileListPaging(pane);
+  const target = parseInt(newPage, 10);
+  if (paging && Number.isFinite(target)) {
+    const folderKey = String(window.currentFolder || 'root');
+    if (window.viewMode === 'table' && window.showInlineFolders !== false) {
+      const sourceId = String(getPaneSourceId(pane) || getGlobalActiveSourceId() || '');
+      const subfolders = getSubfoldersForPagingContext(pane, folderKey, sourceId);
+      const totalFolders = Array.isArray(subfolders) ? subfolders.length : 0;
+      const totalFiles = Number.isFinite(Number(paging.total)) ? Math.max(0, Number(paging.total)) : 0;
+      const layout = getCombinedPageLayout({
+        totalFolders,
+        totalFiles,
+        itemsPerPage: getFileListCursorPageSize(),
+        targetPage: target
+      });
+
+      window.currentPage = layout.page;
+      savePaneState(pane, { currentPage: layout.page });
+
+      if (layout.fileCount <= 0) {
+        renderFileTable(folderKey);
+        return;
+      }
+
+      const targetCursor = String(layout.fileStart);
+      const currentCursor = String((paging.cursor == null) ? '' : paging.cursor);
+      const cursorOffset = parseCursorOffset(currentCursor);
+      const loadedCount = Array.isArray(fileData) ? fileData.length : 0;
+      const loadedEnd = cursorOffset + Math.max(0, loadedCount);
+      const requiredEnd = layout.fileStart + layout.fileCount;
+      const hasRange = cursorOffset <= layout.fileStart && loadedEnd >= requiredEnd;
+
+      if (currentCursor === targetCursor && hasRange) {
+        renderFileTable(folderKey);
+        return;
+      }
+
+      loadFileList(folderKey, { pane, cursor: targetCursor });
+      return;
+    }
+
+    const pageSize = Number.isFinite(Number(paging.limit))
+      ? Math.max(1, Number(paging.limit))
+      : getFileListCursorPageSize();
+    const totalPages = Number.isFinite(Number(paging.totalPages))
+      ? Math.max(1, Number(paging.totalPages))
+      : Math.max(1, Math.ceil((Number(paging.total) || 0) / pageSize));
+    const clampedTarget = Math.max(1, Math.min(totalPages, target));
+    const targetCursor = String(Math.max(0, (clampedTarget - 1) * pageSize));
+    const currentCursor = String((paging.cursor == null) ? '' : paging.cursor);
+    if (targetCursor === currentCursor) {
+      if (window.viewMode === 'gallery') {
+        renderGalleryView(folderKey);
+      } else {
+        renderFileTable(folderKey);
+      }
+      return;
+    }
+    loadFileList(folderKey, { pane, cursor: targetCursor });
+    return;
+  }
   window.currentPage = newPage;
   if (window.viewMode === 'gallery') {
     renderGalleryView(window.currentFolder);
@@ -8006,6 +8640,13 @@ window.changeItemsPerPage = function (newCount) {
   window.itemsPerPage = parseInt(newCount, 10);
   localStorage.setItem('itemsPerPage', newCount);
   window.currentPage = 1;
+  const pane = normalizePaneKey(window.activePane);
+  savePaneState(pane, { currentPage: 1 });
+  const paging = getPaneFileListPaging(pane);
+  if (paging) {
+    loadFileList(window.currentFolder || 'root', { pane, cursor: '' });
+    return;
+  }
   if (window.viewMode === 'gallery') {
     renderGalleryView(window.currentFolder);
   } else {

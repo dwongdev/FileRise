@@ -1,5 +1,7 @@
 <?php
+
 declare(strict_types=1);
+
 // Pro Search Everywhere query endpoint
 /**
  * @OA\Get(
@@ -26,8 +28,11 @@ header('Cache-Control: no-store');
 header('X-Content-Type-Options: nosniff');
 
 require_once __DIR__ . '/../../../../config/config.php';
+require_once PROJECT_ROOT . '/src/lib/ACL.php';
 
-if (session_status() !== PHP_SESSION_ACTIVE) session_start();
+if (session_status() !== PHP_SESSION_ACTIVE) {
+    session_start();
+}
 if (empty($_SESSION['authenticated'])) {
     http_response_code(401);
     echo json_encode(['ok' => false, 'error' => 'Unauthorized']);
@@ -60,7 +65,9 @@ $result = ProSearch::query($qRaw, $limit, $username, $perms, $force, $sourceId);
 
 if (empty($result['ok'])) {
     $code = 400;
-    if (($result['error'] ?? '') === 'disabled') $code = 503;
+    if (($result['error'] ?? '') === 'disabled') {
+        $code = 503;
+    }
     http_response_code($code);
 }
 

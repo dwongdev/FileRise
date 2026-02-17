@@ -12,6 +12,7 @@ use FileRise\Domain\AdminModel;
 use FileRise\Domain\FolderCrypto;
 use FileRise\Domain\FolderMeta;
 use FileRise\Domain\FolderModel;
+use FileRise\Domain\TransferJobManager;
 use FileRise\Domain\UploadModel;
 use FileRise\Domain\UserModel as userModel;
 use FilesystemIterator;
@@ -31,6 +32,8 @@ require_once PROJECT_ROOT . '/src/lib/SourceContext.php';
 
 class FolderController
 {
+    private ?array $jsonBodyOverride = null;
+
     /* -------------------- Session / Header helpers -------------------- */
     private static function ensureSession(): void
     {
@@ -64,6 +67,88 @@ class FolderController
             return '';
         }
         return $id;
+    }
+
+    public function setJsonBodyOverride(?array $payload): void
+    {
+        $this->jsonBodyOverride = $payload;
+    }
+
+    private function readJsonBody(): array
+    {
+        if (is_array($this->jsonBodyOverride)) {
+            return $this->jsonBodyOverride;
+        }
+        $raw = file_get_contents('php://input') ?: '';
+        $in = json_decode($raw, true);
+        return is_array($in) ? $in : [];
+    }
+
+    private function truthy($value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_int($value) || is_float($value)) {
+            return ((int)$value) !== 0;
+        }
+        $s = strtolower(trim((string)$value));
+        return in_array($s, ['1', 'true', 'yes', 'on'], true);
+    }
+
+    private function isAsyncRequested(array $payload): bool
+    {
+        return $this->truthy($payload['async'] ?? false)
+            || $this->truthy($payload['queue'] ?? false)
+            || $this->truthy($payload['asyncJob'] ?? false);
+    }
+
+    private function enqueueTransferJob(array $jobSpec): array
+    {
+        try {
+            $user = trim((string)($jobSpec['user'] ?? ''));
+            if ($user === '') {
+                return ['error' => 'Missing transfer job user.'];
+            }
+            $jobSpec['user'] = $user;
+
+            $selectedFiles = (int)($jobSpec['selectedFiles'] ?? 0);
+            $selectedBytes = (int)($jobSpec['selectedBytes'] ?? 0);
+            if ($selectedFiles < 0) {
+                $selectedFiles = 0;
+            }
+            if ($selectedBytes < 0) {
+                $selectedBytes = 0;
+            }
+            $jobSpec['selectedFiles'] = $selectedFiles;
+            $jobSpec['selectedBytes'] = $selectedBytes;
+
+            $created = TransferJobManager::create($jobSpec);
+            $jobId = (string)($created['id'] ?? '');
+            if ($jobId === '') {
+                return ['error' => 'Failed to create transfer job.'];
+            }
+
+            $spawn = TransferJobManager::spawnWorker($jobId);
+            if (empty($spawn['ok'])) {
+                $job = TransferJobManager::load($jobId) ?: [];
+                $job['status'] = 'error';
+                $job['phase'] = 'error';
+                $job['error'] = 'Worker spawn failed: ' . (string)($spawn['error'] ?? 'Unknown error');
+                $job['endedAt'] = time();
+                TransferJobManager::save($jobId, $job);
+                return ['error' => 'Failed to start transfer worker: ' . (string)($spawn['error'] ?? 'Unknown error')];
+            }
+
+            return [
+                'ok' => true,
+                'jobId' => $jobId,
+                'status' => 'queued',
+                'statusUrl' => '/api/file/transferJobStatus.php?jobId=' . urlencode($jobId),
+            ];
+        } catch (\Throwable $e) {
+            return ['error' => 'Failed to queue transfer job.'];
+        }
     }
 
     private function withSourceContext(string $sourceId, callable $fn, bool $allowDisabled = false)
@@ -422,6 +507,12 @@ class FolderController
             header('Content-Type: application/json');
             echo json_encode(['error' => 'Unauthorized']);
             exit;
+        }
+    }
+    private static function releaseSessionLock(): void
+    {
+        if (session_status() === PHP_SESSION_ACTIVE) {
+            @session_write_close();
         }
     }
 
@@ -2200,11 +2291,11 @@ class FolderController
             return;
         }
 
-        $raw = file_get_contents('php://input');
-        $input = json_decode($raw ?: "{}", true);
+        $input = $this->readJsonBody();
         $source = trim((string)($input['source'] ?? ''));
         $destination = trim((string)($input['destination'] ?? ''));
         $mode = strtolower(trim((string)($input['mode'] ?? 'move')));
+        $asyncRequested = $this->isAsyncRequested($input);
         if ($mode !== 'move' && $mode !== 'copy') {
             http_response_code(400);
             echo json_encode(['error' => 'Invalid mode']);
@@ -2350,6 +2441,32 @@ class FolderController
             $baseName = basename(str_replace('\\', '/', $srcNorm));
             $target   = $destination === 'root' ? $baseName : rtrim($destination, "/\\ ") . '/' . $baseName;
 
+            if ($asyncRequested) {
+                $queued = $this->enqueueTransferJob([
+                    'user' => $username,
+                    'kind' => ($mode === 'move') ? 'folder_move' : 'folder_copy',
+                    'itemType' => 'folder',
+                    'mode' => $mode,
+                    'sourceFolder' => $source,
+                    'destinationFolder' => $destination,
+                    'targetFolder' => $target,
+                    'sourceId' => $sourceId,
+                    'destSourceId' => $destSourceId,
+                    'crossSource' => $crossSource,
+                    'selectedFiles' => is_numeric($input['totalFiles'] ?? null) ? (int)$input['totalFiles'] : 1,
+                    'selectedBytes' => is_numeric($input['totalBytes'] ?? null) ? (int)$input['totalBytes'] : 0,
+                ]);
+                if (isset($queued['error'])) {
+                    http_response_code(500);
+                    echo json_encode(['error' => $queued['error']]);
+                    return;
+                }
+                http_response_code(202);
+                echo json_encode($queued, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+                return;
+            }
+
+            self::releaseSessionLock();
             if ($crossSource) {
                 $result = ($mode === 'move')
                     ? FolderModel::moveFolderAcrossSources($sourceId, $destSourceId, $source, $target)
@@ -2423,12 +2540,36 @@ class FolderController
         $baseName = basename(str_replace('\\', '/', $srcNorm));
         $target   = $destination === 'root' ? $baseName : rtrim($destination, "/\\ ") . '/' . $baseName;
 
+        if ($asyncRequested) {
+            $queued = $this->enqueueTransferJob([
+                'user' => $username,
+                'kind' => 'folder_move',
+                'itemType' => 'folder',
+                'mode' => 'move',
+                'sourceFolder' => $source,
+                'destinationFolder' => $destination,
+                'targetFolder' => $target,
+                'sourceId' => $sourceId,
+                'destSourceId' => $destSourceId,
+                'crossSource' => false,
+                'selectedFiles' => is_numeric($input['totalFiles'] ?? null) ? (int)$input['totalFiles'] : 1,
+                'selectedBytes' => is_numeric($input['totalBytes'] ?? null) ? (int)$input['totalBytes'] : 0,
+            ]);
+            if (isset($queued['error'])) {
+                http_response_code(500);
+                echo json_encode(['error' => $queued['error']]);
+                return;
+            }
+            http_response_code(202);
+            echo json_encode($queued, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            return;
+        }
+
         try {
+            self::releaseSessionLock();
             $result = FolderModel::renameFolder($source, $target);
-
-            $result = FolderModel::renameFolder($source, $target);
-
-            if (is_array($result) && (!isset($result['success']) || $result['success'])) {
+            $moveSucceeded = !is_array($result) || !isset($result['success']) || !empty($result['success']);
+            if ($moveSucceeded) {
                 AuditHook::log('folder.move', [
                     'user'   => $username,
                     'folder' => $target,
@@ -2439,21 +2580,17 @@ class FolderController
 
             // migrate ACL subtree (best-effort; never block the move)
             $aclStats = [];
-            try {
-                $aclStats = ACL::migrateSubtree($source, $target);
-            } catch (\Throwable $e) {
-                error_log('moveFolder ACL-migration warning: ' . $e->getMessage());
+            if ($moveSucceeded) {
+                try {
+                    $aclStats = ACL::migrateSubtree($source, $target);
+                } catch (\Throwable $e) {
+                    error_log('moveFolder ACL-migration warning: ' . $e->getMessage());
+                }
             }
-
-            // If you already added color migration, just append this too:
-            $resultArr = is_array($result) ? $result : ['success' => true, 'target' => $target];
-            $resultArr['aclMigration'] = $aclStats + ['changed' => false, 'moved' => 0];
-
-            echo json_encode($resultArr, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
             // If the move succeeded, migrate folder color mappings server-side
             $colorStats = [];
-            if (is_array($result) && (!isset($result['success']) || $result['success'])) {
+            if ($moveSucceeded) {
                 try {
                     $colorStats = self::migrateFolderColors($source, $target);
                 } catch (\Throwable $e) {
@@ -2461,13 +2598,11 @@ class FolderController
                 }
             }
 
-            // merge stats into response (non-breaking)
-            if (is_array($result)) {
-                $result['colorMigration'] = $colorStats + ['changed' => false, 'moved' => 0];
-                echo json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-            } else {
-                echo json_encode(['success' => true, 'target' => $target, 'colorMigration' => $colorStats + ['changed' => false, 'moved' => 0]], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-            }
+            // merge stats into response (single payload, non-breaking fields)
+            $resultArr = is_array($result) ? $result : ['success' => true, 'target' => $target];
+            $resultArr['aclMigration'] = $aclStats + ['changed' => false, 'moved' => 0];
+            $resultArr['colorMigration'] = $colorStats + ['changed' => false, 'moved' => 0];
+            echo json_encode($resultArr, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         } catch (\Throwable $e) {
             error_log('moveFolder error: ' . $e->getMessage());
             http_response_code(500);

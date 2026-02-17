@@ -1,7 +1,8 @@
 <?php
+
 // public/api/pro/diskUsageDeleteFilePermanent.php
 /**
- * @OA\Post(
+ * @OA@Post(
  *   path="/api/pro/diskUsageDeleteFilePermanent.php",
  *   summary="Permanently delete a file",
  *   description="Deletes a single file from storage explorer (Pro, admin).",
@@ -30,7 +31,7 @@ declare(strict_types=1);
 header('Content-Type: application/json; charset=utf-8');
 
 require_once __DIR__ . '/../../../config/config.php';
-require_once PROJECT_ROOT . '/src/lib/SourceContext.php';
+require_once PROJECT_ROOT . '/src/FileRise/Domain/SourceAccessService.php';
 
 // Pro-only gate: make sure Pro is really active
 if (!defined('FR_PRO_ACTIVE') || !FR_PRO_ACTIVE || !fr_pro_api_level_at_least(FR_PRO_API_REQUIRE_DISK_USAGE)) {
@@ -54,7 +55,7 @@ try {
     \FileRise\Http\Controllers\AdminController::requireAdmin();
     \FileRise\Http\Controllers\AdminController::requireCsrf();
 
-    $raw  = file_get_contents('php://input');
+    $raw = file_get_contents('php://input');
     $body = json_decode($raw, true);
     if (!is_array($body) || empty($body['name'])) {
         http_response_code(400);
@@ -64,46 +65,31 @@ try {
 
     $folder = isset($body['folder']) ? (string)$body['folder'] : 'root';
     $folder = $folder === '' ? 'root' : trim($folder, "/\\ ");
-    $name   = (string)$body['name'];
-
+    $name = (string)$body['name'];
     $sourceId = isset($body['sourceId']) ? trim((string)$body['sourceId']) : '';
-    $prevSourceId = null;
-    if ($sourceId !== '' && class_exists('SourceContext') && SourceContext::sourcesEnabled()) {
-        if (!preg_match('/^[A-Za-z0-9_-]{1,64}$/', $sourceId)) {
-            http_response_code(400);
-            echo json_encode(['ok' => false, 'error' => 'Invalid source id.']);
-            return;
-        }
-        $src = SourceContext::getSourceById($sourceId);
-        if (!$src || empty($src['enabled'])) {
-            http_response_code(400);
-            echo json_encode(['ok' => false, 'error' => 'Invalid source id.']);
-            return;
-        }
-        $type = strtolower((string)($src['type'] ?? 'local'));
-        if ($type !== 'local') {
-            http_response_code(400);
-            echo json_encode(['ok' => false, 'error' => 'Storage explorer is only available for local sources.']);
-            return;
-        }
-        $prevSourceId = SourceContext::getActiveId();
-        SourceContext::setActiveId($sourceId, false, true);
+
+    if ($sourceId !== '') {
+        $res = \FileRise\Domain\SourceAccessService::withLocalExplorerSource($sourceId, static function () use ($folder, $name) {
+            return \FileRise\Domain\FileModel::deleteFilesPermanent($folder, [$name]);
+        });
+    } else {
+        $res = \FileRise\Domain\FileModel::deleteFilesPermanent($folder, [$name]);
     }
 
-    try {
-        $res = \FileRise\Domain\FileModel::deleteFilesPermanent($folder, [$name]);
-    } finally {
-        if ($prevSourceId !== null) {
-            SourceContext::setActiveId($prevSourceId, false, true);
-        }
-    }
     if (!empty($res['error'])) {
         echo json_encode(['ok' => false, 'error' => $res['error']]);
     } else {
         echo json_encode(['ok' => true, 'success' => $res['success'] ?? 'File deleted.']);
     }
 } catch (Throwable $e) {
-    error_log('diskUsageDeleteFilePermanent error: '.$e->getMessage());
+    $code = (int)$e->getCode();
+    if ($code >= 400 && $code <= 599) {
+        http_response_code($code);
+        echo json_encode(['ok' => false, 'error' => $e->getMessage()]);
+        return;
+    }
+
+    error_log('diskUsageDeleteFilePermanent error: ' . $e->getMessage());
     http_response_code(500);
     echo json_encode(['ok' => false, 'error' => 'Internal error']);
 }

@@ -1,13 +1,14 @@
 <?php
+
 // public/api/pro/sources/visible.php
 declare(strict_types=1);
 
 header('Content-Type: application/json; charset=utf-8');
 
 require_once __DIR__ . '/../../../../config/config.php';
-require_once PROJECT_ROOT . '/src/lib/ACL.php';
 require_once PROJECT_ROOT . '/src/lib/SourceContext.php';
 require_once PROJECT_ROOT . '/src/lib/SourcesConfig.php';
+require_once PROJECT_ROOT . '/src/FileRise/Domain/SourceAccessService.php';
 
 try {
     if (session_status() !== PHP_SESSION_ACTIVE) {
@@ -17,23 +18,7 @@ try {
     \FileRise\Http\Controllers\AdminController::requireAuth();
 
     $username = (string)($_SESSION['username'] ?? '');
-    $perms = [];
-    try {
-        if (function_exists('loadUserPermissions')) {
-            $p = loadUserPermissions($username);
-            $perms = is_array($p) ? $p : [];
-        } elseif (class_exists(\FileRise\Domain\UserModel::class) && method_exists(\FileRise\Domain\UserModel::class, 'getUserPermissions')) {
-            $all = \FileRise\Domain\UserModel::getUserPermissions();
-            if (is_array($all)) {
-                if (isset($all[$username])) {
-                    $perms = (array)$all[$username];
-                } else {
-                    $lk = strtolower($username);
-                    if (isset($all[$lk])) $perms = (array)$all[$lk];
-                }
-            }
-        }
-    } catch (Throwable $e) { /* ignore */ }
+    $perms = \FileRise\Domain\SourceAccessService::loadUserPermissions($username);
 
     $activeId = class_exists('SourceContext') ? SourceContext::getActiveId() : '';
     $cfg = SourcesConfig::getPublicConfig();
@@ -55,23 +40,7 @@ try {
         exit;
     }
 
-    $visible = [];
-    $originalId = $activeId;
-    foreach ($sources as $src) {
-        if (!is_array($src)) continue;
-        $id = (string)($src['id'] ?? '');
-        if ($id === '') continue;
-
-        if (class_exists('SourceContext')) {
-            SourceContext::setActiveId($id, false);
-        }
-        if (ACL::userHasAnyAccess($username, $perms, 'root')) {
-            $visible[] = $src;
-        }
-    }
-    if (class_exists('SourceContext') && $originalId !== '') {
-        SourceContext::setActiveId($originalId, false);
-    }
+    $visible = \FileRise\Domain\SourceAccessService::filterVisibleSources($sources, $username, $perms);
 
     echo json_encode([
         'ok' => true,
@@ -85,7 +54,13 @@ try {
         'proTypes' => $cfg['proTypes'] ?? [],
     ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 } catch (Throwable $e) {
-    http_response_code(500);
+    $code = (int)$e->getCode();
+    if ($code >= 400 && $code <= 599) {
+        http_response_code($code);
+    } else {
+        http_response_code(500);
+    }
+
     echo json_encode([
         'ok' => false,
         'error' => 'Error loading sources',

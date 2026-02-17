@@ -730,6 +730,8 @@ const translations = {
     "move_files_success_to": "Moved {count} file(s) to {folder}.",
     "move_folder_error_default": "Could not move folder.",
     "move_folder_error_detail": "Error moving folder: {error}",
+    "move_folder_success_named_to": "Moved folder \"{name}\" to {folder}.",
+    "move_folder_success_named_from_to": "Moved folder \"{name}\" from {source} to {folder}.",
     "move_folder_success_to": "Folder moved to {folder}.",
     "move_same_folder_error": "Cannot move files to the same folder.",
     "move_target_folder_required": "Please select a target folder for moving.",

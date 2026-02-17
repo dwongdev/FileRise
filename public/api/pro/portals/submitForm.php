@@ -1,7 +1,8 @@
 <?php
+
 // public/api/pro/portals/submitForm.php
 /**
- * @OA\Post(
+ * @OA@Post(
  *   path="/api/pro/portals/submitForm.php",
  *   summary="Submit portal form",
  *   description="Submits a portal form payload (requires auth, Pro).",
@@ -37,25 +38,7 @@ declare(strict_types=1);
 header('Content-Type: application/json; charset=utf-8');
 
 require_once __DIR__ . '/../../../../config/config.php';
-
-function generatePortalSubmissionRef(): string
-{
-    try {
-        $rand = strtoupper(bin2hex(random_bytes(3)));
-    } catch (\Throwable $e) {
-        $rand = strtoupper(substr(sha1(uniqid('', true)), 0, 6));
-    }
-    return 'PRT-' . gmdate('Ymd') . '-' . $rand;
-}
-
-function sanitizePortalSubmissionRef(string $value): string
-{
-    $clean = strtoupper(preg_replace('/[^A-Za-z0-9_-]/', '', $value));
-    if ($clean === '') {
-        return '';
-    }
-    return substr($clean, 0, 48);
-}
+require_once PROJECT_ROOT . '/src/FileRise/Domain/PortalSubmissionsService.php';
 
 try {
     if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
@@ -68,11 +51,10 @@ try {
         session_start();
     }
 
-    // For now, portal forms still require a logged-in user
     \FileRise\Http\Controllers\AdminController::requireAuth();
     \FileRise\Http\Controllers\AdminController::requireCsrf();
 
-    $raw  = file_get_contents('php://input');
+    $raw = file_get_contents('php://input');
     $body = json_decode($raw, true);
     if (!is_array($body)) {
         http_response_code(400);
@@ -87,85 +69,33 @@ try {
         return;
     }
 
-    $form = isset($body['form']) && is_array($body['form']) ? $body['form'] : [];
-    $name      = trim((string)($form['name'] ?? ''));
-    $email     = trim((string)($form['email'] ?? ''));
-    $reference = trim((string)($form['reference'] ?? ''));
-    $notes     = trim((string)($form['notes'] ?? ''));
-    $submissionRefRaw = isset($body['submissionRef']) ? (string)$body['submissionRef'] : '';
-    $submissionRef = sanitizePortalSubmissionRef($submissionRefRaw);
-    if ($submissionRef === '') {
-        $submissionRef = generatePortalSubmissionRef();
-    }
-
     // Make sure portal exists and is not expired
     $portal = \FileRise\Http\Controllers\PortalController::getPortalBySlug($slug);
 
-    if (!defined('FR_PRO_ACTIVE') || !FR_PRO_ACTIVE || !defined('FR_PRO_BUNDLE_DIR') || !FR_PRO_BUNDLE_DIR) {
-        throw new RuntimeException('FileRise Pro is not active.');
-    }
-
-    $subPath = rtrim((string)FR_PRO_BUNDLE_DIR, "/\\") . '/ProPortalSubmissions.php';
-    if (!is_file($subPath)) {
-        throw new RuntimeException('ProPortalSubmissions.php not found in Pro bundle.');
-    }
-    require_once $subPath;
-
     $submittedBy = (string)($_SESSION['username'] ?? '');
+    $built = \FileRise\Domain\PortalSubmissionsService::buildSubmissionPayload(
+        $slug,
+        $portal,
+        $body,
+        $submittedBy,
+        $_SERVER
+    );
 
-    // ─────────────────────────────
-    // Better client IP detection
-    // ─────────────────────────────
-    $ip = '';
-    if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-        // Can be a comma-separated list; use the first non-empty
-        $parts = explode(',', (string)$_SERVER['HTTP_X_FORWARDED_FOR']);
-        foreach ($parts as $part) {
-            $candidate = trim($part);
-            if ($candidate !== '') {
-                $ip = $candidate;
-                break;
-            }
-        }
-    } elseif (!empty($_SERVER['HTTP_X_REAL_IP'])) {
-        $ip = trim((string)$_SERVER['HTTP_X_REAL_IP']);
-    } elseif (!empty($_SERVER['REMOTE_ADDR'])) {
-        $ip = trim((string)$_SERVER['REMOTE_ADDR']);
-    }
-
-    $payload = [
-        'slug'        => $slug,
-        'portalLabel' => $portal['label'] ?? '',
-        'folder'      => $portal['folder'] ?? '',
-        'sourceId'    => $portal['sourceId'] ?? '',
-        'submissionRef' => $submissionRef,
-        'form'        => [
-            'name'      => $name,
-            'email'     => $email,
-            'reference' => $reference,
-            'notes'     => $notes,
-        ],
-        'submittedBy' => $submittedBy,
-        'ip'          => $ip,
-        'userAgent'   => $_SERVER['HTTP_USER_AGENT'] ?? '',
-        'createdAt'   => gmdate('c'),
-    ];
-
-    $store = new ProPortalSubmissions(FR_PRO_BUNDLE_DIR);
-    $ok    = $store->store($slug, $payload);
-    if (!$ok) {
-        throw new RuntimeException('Failed to store portal submission.');
-    }
+    \FileRise\Domain\PortalSubmissionsService::storeSubmission($slug, $built['payload']);
 
     echo json_encode([
         'success' => true,
-        'submissionRef' => $submissionRef,
+        'submissionRef' => $built['submissionRef'],
     ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 } catch (Throwable $e) {
     $code = $e instanceof InvalidArgumentException ? 400 : 500;
+    if ((int)$e->getCode() >= 400 && (int)$e->getCode() <= 599) {
+        $code = (int)$e->getCode();
+    }
+
     http_response_code($code);
     echo json_encode([
         'success' => false,
-        'error'   => $e->getMessage(),
+        'error' => $e->getMessage(),
     ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 }

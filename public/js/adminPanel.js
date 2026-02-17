@@ -1731,7 +1731,23 @@ function initSourcesSection({
   };
 
   const normalizeTestState = (value) =>
-    (value === 'testing' || value === 'ok' || value === 'error') ? value : 'idle';
+    (value === 'testing' || value === 'ok' || value === 'warning' || value === 'error') ? value : 'idle';
+
+  const normalizeCheckState = (value) =>
+    (value === 'ok' || value === 'fail' || value === 'skipped' || value === 'unknown') ? value : 'unknown';
+
+  const normalizeTestChecks = (checks) => {
+    if (!Array.isArray(checks)) return [];
+    return checks
+      .filter((check) => check && typeof check === 'object')
+      .map((check) => ({
+        key: String(check.key || '').trim(),
+        label: String(check.label || check.key || '').trim(),
+        state: normalizeCheckState(check.state),
+        message: String(check.message || '').trim(),
+      }))
+      .filter((check) => check.key !== '');
+  };
 
   const truncateTestMessage = (msg, max = 80) => {
     const clean = String(msg || '').replace(/\s+/g, ' ').trim();
@@ -1742,6 +1758,16 @@ function initSourcesSection({
   const testStatusLabel = (state, message) => {
     if (state === 'testing') return tf('source_test_running', 'Testing...');
     if (state === 'ok') return tf('source_test_ok', 'Connected');
+    if (state === 'warning') {
+      const base = tf('source_test_limited', 'Connected (limited)');
+      const detail = message ? truncateTestMessage(message, 52) : '';
+      if (!detail) return base;
+      const lowerDetail = detail.toLowerCase();
+      if (lowerDetail === base.toLowerCase() || lowerDetail === 'connected with permission limitations') {
+        return base;
+      }
+      return detail ? `${base}: ${detail}` : base;
+    }
     if (state === 'error') {
       const base = tf('source_test_failed', 'Failed');
       const detail = message ? truncateTestMessage(message, 60) : '';
@@ -1750,11 +1776,71 @@ function initSourcesSection({
     return tf('source_test_idle', 'Not tested');
   };
 
+  const capabilityLabelMap = {
+    read: tf('source_cap_read', 'Read'),
+    createFolder: tf('source_cap_create', 'Create'),
+    write: tf('source_cap_write', 'Write'),
+    moveRename: tf('source_cap_move', 'Move/Rename'),
+    delete: tf('source_cap_delete', 'Delete'),
+  };
+
+  const capabilityOrder = ['read', 'createFolder', 'write', 'moveRename', 'delete'];
+
+  const normalizeCapabilities = (raw) => {
+    if (!raw || typeof raw !== 'object') return {};
+    const out = {};
+    capabilityOrder.forEach((key) => {
+      if (!Object.prototype.hasOwnProperty.call(raw, key)) return;
+      const value = raw[key];
+      out[key] = (value === true) ? true : ((value === false) ? false : null);
+    });
+    return out;
+  };
+
+  const getCapabilityState = (key, testState) => {
+    const checks = Array.isArray(testState?.checks) ? testState.checks : [];
+    const found = checks.find((check) => check.key === key);
+    if (found) return normalizeCheckState(found.state);
+
+    const caps = testState && typeof testState.capabilities === 'object'
+      ? testState.capabilities
+      : {};
+    if (!Object.prototype.hasOwnProperty.call(caps, key)) return 'unknown';
+    if (caps[key] === true) return 'ok';
+    if (caps[key] === false) return 'fail';
+    return 'skipped';
+  };
+
+  const getCapabilityTitle = (key, testState, state) => {
+    const label = capabilityLabelMap[key] || key;
+    const checks = Array.isArray(testState?.checks) ? testState.checks : [];
+    const found = checks.find((check) => check.key === key);
+    const detail = found && found.message ? `: ${found.message}` : '';
+    if (state === 'ok') return `${label}: OK${detail}`;
+    if (state === 'fail') return `${label}: Failed${detail}`;
+    if (state === 'skipped') return `${label}: Skipped${detail}`;
+    return `${label}: Not tested`;
+  };
+
+  const renderCapabilityBadges = (testState) => {
+    if (!testState || testState.state === 'idle' || testState.state === 'testing') {
+      return '';
+    }
+    return capabilityOrder.map((key) => {
+      const label = capabilityLabelMap[key] || key;
+      const capState = getCapabilityState(key, testState);
+      return `<span class="sources-capability cap-${capState}" title="${esc(getCapabilityTitle(key, testState, capState))}">${esc(label)}</span>`;
+    }).join('');
+  };
+
   const getTestStatus = (id) => {
     const entry = (state.testStatus && state.testStatus[id]) ? state.testStatus[id] : {};
     return {
       state: normalizeTestState(entry.state),
-      message: entry.message ? String(entry.message) : ''
+      message: entry.message ? String(entry.message) : '',
+      checks: normalizeTestChecks(entry.checks),
+      capabilities: normalizeCapabilities(entry.capabilities),
+      limited: !!entry.limited,
     };
   };
 
@@ -2002,6 +2088,10 @@ function initSourcesSection({
       const statusClass = `sources-test-status status-${testState.state}`;
       const statusTitle = testState.message ? ` title="${esc(testState.message)}"` : '';
       const testDisabled = (testState.state === 'testing') ? 'disabled' : '';
+      const capabilityBadges = renderCapabilityBadges(testState);
+      const capabilityWrap = capabilityBadges
+        ? `<div class="sources-capabilities">${capabilityBadges}</div>`
+        : '';
       const rowClass = [
         'sources-row',
         'sources-row-data',
@@ -2016,7 +2106,10 @@ function initSourcesSection({
 
       return `
         <div class="${rowClass}" data-id="${esc(id)}">
-          <div class="sources-cell sources-name"><span class="sources-name-text">${esc(name)}</span>${lockIcon}${badgeWrap}</div>
+          <div class="sources-cell sources-name">
+            <div class="sources-name-main"><span class="sources-name-text">${esc(name)}</span>${lockIcon}${badgeWrap}</div>
+            ${capabilityWrap}
+          </div>
           <div class="sources-cell">${esc(type)}</div>
           <div class="sources-cell"><code>${esc(id)}</code></div>
           <div class="sources-actions">
@@ -2078,7 +2171,7 @@ function initSourcesSection({
     if (current.state === 'testing') {
       return null;
     }
-    setTestStatus(id, { state: 'testing', message: '' });
+    setTestStatus(id, { state: 'testing', message: '', checks: [], capabilities: {}, limited: false });
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 25000);
     try {
@@ -2094,15 +2187,35 @@ function initSourcesSection({
         signal: controller.signal,
       });
       const data = await safeJson(res);
+      const checks = normalizeTestChecks(data && data.checks);
+      const capabilities = normalizeCapabilities(data && data.capabilities);
+      const limited = !!(data && data.limited);
+      if (!data || data.ok !== true) {
+        const msg = String((data && (data.error || data.message)) || tf('source_test_error', 'Test failed')).trim();
+        setTestStatus(id, { state: 'error', message: msg, checks, capabilities, limited: false });
+        showToast(msg, 5000);
+        return false;
+      }
+
       const msg = data && data.message ? String(data.message) : '';
-      setTestStatus(id, { state: 'ok', message: msg });
+      setTestStatus(id, {
+        state: limited ? 'warning' : 'ok',
+        message: msg,
+        checks,
+        capabilities,
+        limited,
+      });
+      if (limited) {
+        const warn = msg || tf('source_test_limited', 'Connected (limited)');
+        showToast(warn, 5000);
+      }
       return true;
     } catch (err) {
       const timedOut = err && err.name === 'AbortError';
       const msg = timedOut
         ? tf('source_test_timeout', 'Test timed out.')
         : (err?.message || tf('source_test_error', 'Test failed'));
-      setTestStatus(id, { state: 'error', message: msg });
+      setTestStatus(id, { state: 'error', message: msg, checks: [], capabilities: {}, limited: false });
       showToast(msg, 5000);
       return false;
     } finally {
@@ -2441,11 +2554,30 @@ function initSourcesSection({
         await loadSources();
 
         if (data?.autoTested) {
+          const autoTest = (data && typeof data.autoTest === 'object' && data.autoTest) ? data.autoTest : {};
+          const checks = normalizeTestChecks(autoTest.checks);
+          const capabilities = normalizeCapabilities(autoTest.capabilities);
           if (data.autoTestOk) {
-            setTestStatus(id, { state: 'ok', message: '' });
+            const limited = !!(autoTest && autoTest.limited);
+            setTestStatus(id, {
+              state: limited ? 'warning' : 'ok',
+              message: String(autoTest.message || ''),
+              checks,
+              capabilities,
+              limited,
+            });
+            if (limited) {
+              showToast(String(autoTest.message || tf('source_test_limited', 'Connected (limited)')), 5000);
+            }
           } else {
             const errMsg = data.autoTestError || tf('source_test_error', 'Test failed');
-            setTestStatus(id, { state: 'error', message: errMsg });
+            setTestStatus(id, {
+              state: 'error',
+              message: errMsg,
+              checks,
+              capabilities,
+              limited: false,
+            });
             const disabledNote = data.autoDisabled ? t('admin_source_test_left_disabled_note') : '';
             showToast(t('admin_source_test_failed_detail', { error: errMsg, note: disabledNote }), 5000);
           }

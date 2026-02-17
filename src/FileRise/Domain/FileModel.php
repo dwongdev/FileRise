@@ -3349,7 +3349,7 @@ class FileModel
      * @param string $folder The folder name (e.g., "root" or a subfolder).
      * @return array Returns an associative array with keys "files" and "globalTags".
      */
-    public static function getFileList(string $folder): array
+    public static function getFileList(string $folder, array $options = []): array
     {
         // --- caps for safe inlining ---
         if (!defined('LISTING_CONTENT_BYTES_MAX')) {
@@ -3359,9 +3359,40 @@ class FileModel
             define('INDEX_TEXT_BYTES_MAX', 5 * 1024 * 1024);     // only sample files ≤ 5 MB
         }
 
+        $includeContent = !empty($options['includeContent']);
+        $pageSizeRaw = isset($options['pageSize']) ? (int)$options['pageSize'] : 0;
+        $pageSize = ($pageSizeRaw > 0) ? max(1, min(500, $pageSizeRaw)) : 0;
+        $cursorRaw = isset($options['cursor']) ? trim((string)$options['cursor']) : '';
+        $cursorOffset = (ctype_digit($cursorRaw)) ? (int)$cursorRaw : 0;
+        if ($cursorOffset < 0) {
+            $cursorOffset = 0;
+        }
+
+        $sortByRaw = trim((string)($options['sortBy'] ?? ''));
+        $sortBy = strtolower($sortByRaw);
+        if (!in_array($sortBy, ['name', 'modified', 'uploaded', 'size', 'uploader'], true)) {
+            $sortBy = '';
+        }
+        if ($sortBy === '' && $pageSize > 0) {
+            $sortBy = 'modified';
+        }
+        $sortDir = strtolower(trim((string)($options['sortDir'] ?? '')));
+        if ($sortDir !== 'asc' && $sortDir !== 'desc') {
+            $sortDir = ($sortBy === 'name' || $sortBy === 'uploader') ? 'asc' : 'desc';
+        }
+        $uploaderExact = trim((string)($options['uploaderExact'] ?? ''));
+
         $folder = trim($folder) ?: 'root';
         $storage = self::storage();
         $activeSourceId = class_exists('SourceContext') ? SourceContext::getActiveId() : '';
+        $parseUploadedTs = static function (string $v): int {
+            $v = trim($v);
+            if ($v === '' || strcasecmp($v, 'Unknown') === 0) {
+                return 0;
+            }
+            $ts = @strtotime($v);
+            return ($ts === false) ? 0 : (int)$ts;
+        };
 
         // Determine the target directory.
         $baseDir = rtrim(self::uploadRoot(), '/\\');
@@ -3495,6 +3526,10 @@ class FileModel
                 }
             }
 
+            if ($uploaderExact !== '' && strcasecmp((string)$fileUploader, $uploaderExact) !== 0) {
+                continue;
+            }
+
             // Size
             $fileSizeBytes = isset($stat['size']) ? (int)$stat['size'] : 0;
             if ($fileSizeBytes >= 1073741824) {
@@ -3539,7 +3574,7 @@ class FileModel
             $fileEntry['content']          = '';
             $fileEntry['contentTruncated'] = false;
 
-            if ($isText && $fileSizeBytes > 0) {
+            if ($includeContent && $isText && $fileSizeBytes > 0) {
                 if ($skipContentForRemote) {
                     $fileEntry['contentTruncated'] = true;
                 } elseif ($fileSizeBytes <= INDEX_TEXT_BYTES_MAX) {
@@ -3565,6 +3600,11 @@ class FileModel
                 $tags = self::sanitizeTags($metadata[$metaKey]['tags']);
             }
             $fileEntry['tags'] = $tags;
+            $fileEntry['_sort_name'] = strtolower($file);
+            $fileEntry['_sort_size'] = $fileSizeBytes;
+            $fileEntry['_sort_uploader'] = strtolower((string)$fileUploader);
+            $fileEntry['_sort_modified'] = (int)$mtime;
+            $fileEntry['_sort_uploaded'] = $parseUploadedTs((string)$fileUploadedDate);
 
             $fileList[] = $fileEntry;
         }
@@ -3573,12 +3613,96 @@ class FileModel
             @finfo_close($finfo);
         }
 
+        if ($sortBy !== '' && !empty($fileList)) {
+            $dirFactor = ($sortDir === 'asc') ? 1 : -1;
+            usort(
+                $fileList,
+                static function (array $a, array $b) use ($sortBy, $dirFactor): int {
+                    $cmp = 0;
+                    switch ($sortBy) {
+                        case 'name':
+                            $cmp = strnatcasecmp((string)($a['_sort_name'] ?? ''), (string)($b['_sort_name'] ?? ''));
+                            break;
+                        case 'uploader':
+                            $cmp = strnatcasecmp((string)($a['_sort_uploader'] ?? ''), (string)($b['_sort_uploader'] ?? ''));
+                            break;
+                        case 'size':
+                            $cmp = ((int)($a['_sort_size'] ?? 0)) <=> ((int)($b['_sort_size'] ?? 0));
+                            break;
+                        case 'uploaded':
+                            $cmp = ((int)($a['_sort_uploaded'] ?? 0)) <=> ((int)($b['_sort_uploaded'] ?? 0));
+                            break;
+                        case 'modified':
+                        default:
+                            $cmp = ((int)($a['_sort_modified'] ?? 0)) <=> ((int)($b['_sort_modified'] ?? 0));
+                            break;
+                    }
+                    if ($cmp === 0) {
+                        $cmp = strnatcasecmp((string)($a['_sort_name'] ?? ''), (string)($b['_sort_name'] ?? ''));
+                    }
+                    return $cmp * $dirFactor;
+                }
+            );
+        }
+
+        $paging = null;
+        if ($pageSize > 0) {
+            $totalFiles = count($fileList);
+            if ($cursorOffset > $totalFiles) {
+                if ($totalFiles > 0) {
+                    $cursorOffset = (int)(floor(($totalFiles - 1) / $pageSize) * $pageSize);
+                } else {
+                    $cursorOffset = 0;
+                }
+            }
+            $pagedFiles = array_slice($fileList, $cursorOffset, $pageSize);
+            $nextOffset = null;
+            if ($cursorOffset + count($pagedFiles) < $totalFiles) {
+                $nextOffset = $cursorOffset + count($pagedFiles);
+            }
+            $prevOffset = $cursorOffset > 0 ? max(0, $cursorOffset - $pageSize) : null;
+            $totalPages = max(1, (int)ceil($totalFiles / $pageSize));
+            $currentPage = (int)floor($cursorOffset / $pageSize) + 1;
+            if ($currentPage > $totalPages) {
+                $currentPage = $totalPages;
+            }
+            $fileList = $pagedFiles;
+            $paging = [
+                'mode'       => 'cursor',
+                'cursor'     => (string)$cursorOffset,
+                'nextCursor' => ($nextOffset === null) ? null : (string)$nextOffset,
+                'prevCursor' => ($prevOffset === null) ? null : (string)$prevOffset,
+                'hasMore'    => $nextOffset !== null,
+                'limit'      => $pageSize,
+                'total'      => $totalFiles,
+                'page'       => $currentPage,
+                'totalPages' => $totalPages,
+                'sortBy'     => ($sortBy !== '') ? $sortBy : null,
+                'sortDir'    => $sortDir,
+            ];
+        }
+
+        foreach ($fileList as &$fileEntry) {
+            unset(
+                $fileEntry['_sort_name'],
+                $fileEntry['_sort_size'],
+                $fileEntry['_sort_uploader'],
+                $fileEntry['_sort_modified'],
+                $fileEntry['_sort_uploaded']
+            );
+        }
+        unset($fileEntry);
+
         // Load global tags.
         $globalTagsFile = self::metaRoot() . "createdTags.json";
         $globalTags = file_exists($globalTagsFile) ? (json_decode(file_get_contents($globalTagsFile), true) ?: []) : [];
         $globalTags = is_array($globalTags) ? self::sanitizeTags($globalTags) : [];
 
-        return ["files" => $fileList, "globalTags" => $globalTags, "sourceId" => $activeSourceId];
+        $out = ["files" => $fileList, "globalTags" => $globalTags, "sourceId" => $activeSourceId];
+        if ($paging !== null) {
+            $out['paging'] = $paging;
+        }
+        return $out;
     }
 
     public static function getAllShareLinks(): array

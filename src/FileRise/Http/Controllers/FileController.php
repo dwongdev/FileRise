@@ -13,6 +13,7 @@ use FileRise\Domain\AdminModel;
 use FileRise\Domain\FileModel;
 use FileRise\Domain\FolderCrypto;
 use FileRise\Domain\FolderModel;
+use FileRise\Domain\TransferJobManager;
 use FileRise\Domain\UserModel as userModel;
 use ErrorException;
 use RuntimeException;
@@ -30,6 +31,8 @@ require_once PROJECT_ROOT . '/src/lib/SourceContext.php';
 
 class FileController
 {
+    private ?array $jsonBodyOverride = null;
+
     /* =========================
      * Permission helpers (fail-closed)
      * ========================= */
@@ -436,11 +439,30 @@ class FileController
         }
         return true;
     }
+    private function releaseSessionLock(): void
+    {
+        if (session_status() === PHP_SESSION_ACTIVE) {
+            @session_write_close();
+        }
+    }
     private function readJsonBody(): array
     {
+        if (is_array($this->jsonBodyOverride)) {
+            return $this->jsonBodyOverride;
+        }
         $raw = file_get_contents('php://input');
         $data = json_decode($raw, true);
         return is_array($data) ? $data : [];
+    }
+    private function withJsonBodyOverride(array $payload, callable $fn): void
+    {
+        $prev = $this->jsonBodyOverride;
+        $this->jsonBodyOverride = $payload;
+        try {
+            $fn();
+        } finally {
+            $this->jsonBodyOverride = $prev;
+        }
     }
     private function normalizeFolder($f): string
     {
@@ -461,6 +483,99 @@ class FileController
     {
         $f = basename((string)$f);
         return $f !== '' && (bool)preg_match(REGEX_FILE_NAME, $f);
+    }
+    private function truthy($value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_int($value) || is_float($value)) {
+            return ((int)$value) !== 0;
+        }
+        $s = strtolower(trim((string)$value));
+        return in_array($s, ['1', 'true', 'yes', 'on'], true);
+    }
+    private function isAsyncRequested(array $payload): bool
+    {
+        return $this->truthy($payload['async'] ?? false)
+            || $this->truthy($payload['queue'] ?? false)
+            || $this->truthy($payload['asyncJob'] ?? false);
+    }
+    private function enqueueTransferJob(array $jobSpec): array
+    {
+        try {
+            $user = trim((string)($jobSpec['user'] ?? ''));
+            if ($user === '') {
+                return ['error' => 'Missing transfer job user.'];
+            }
+            $jobSpec['user'] = $user;
+
+            $selectedFiles = (int)($jobSpec['selectedFiles'] ?? 0);
+            $selectedBytes = (int)($jobSpec['selectedBytes'] ?? 0);
+            if ($selectedFiles < 0) {
+                $selectedFiles = 0;
+            }
+            if ($selectedBytes < 0) {
+                $selectedBytes = 0;
+            }
+            $jobSpec['selectedFiles'] = $selectedFiles;
+            $jobSpec['selectedBytes'] = $selectedBytes;
+
+            $created = TransferJobManager::create($jobSpec);
+            $jobId = (string)($created['id'] ?? '');
+            if ($jobId === '') {
+                return ['error' => 'Failed to create transfer job.'];
+            }
+
+            $spawn = TransferJobManager::spawnWorker($jobId);
+            if (empty($spawn['ok'])) {
+                $job = TransferJobManager::load($jobId) ?: [];
+                $job['status'] = 'error';
+                $job['phase'] = 'error';
+                $job['error'] = 'Worker spawn failed: ' . (string)($spawn['error'] ?? 'Unknown error');
+                $job['endedAt'] = time();
+                TransferJobManager::save($jobId, $job);
+                return ['error' => 'Failed to start transfer worker: ' . (string)($spawn['error'] ?? 'Unknown error')];
+            }
+
+            return [
+                'ok' => true,
+                'jobId' => $jobId,
+                'status' => 'queued',
+                'statusUrl' => '/api/file/transferJobStatus.php?jobId=' . urlencode($jobId),
+            ];
+        } catch (\Throwable $e) {
+            return ['error' => 'Failed to queue transfer job.'];
+        }
+    }
+    private function transferJobToPublic(array $job): array
+    {
+        return [
+            'id' => $job['id'] ?? null,
+            'kind' => $job['kind'] ?? null,
+            'mode' => $job['mode'] ?? null,
+            'itemType' => $job['itemType'] ?? null,
+            'status' => $job['status'] ?? 'unknown',
+            'phase' => $job['phase'] ?? null,
+            'error' => $job['error'] ?? null,
+            'errors' => isset($job['errors']) && is_array($job['errors']) ? array_values($job['errors']) : [],
+            'pct' => $job['pct'] ?? null,
+            'filesDone' => $job['filesDone'] ?? 0,
+            'bytesDone' => $job['bytesDone'] ?? 0,
+            'selectedFiles' => $job['selectedFiles'] ?? 0,
+            'selectedBytes' => $job['selectedBytes'] ?? 0,
+            'current' => $job['current'] ?? null,
+            'cancelRequested' => !empty($job['cancelRequested']),
+            'createdAt' => $job['createdAt'] ?? null,
+            'startedAt' => $job['startedAt'] ?? null,
+            'endedAt' => $job['endedAt'] ?? null,
+            'sourceFolder' => $job['sourceFolder'] ?? null,
+            'destinationFolder' => $job['destinationFolder'] ?? null,
+            'targetFolder' => $job['targetFolder'] ?? null,
+            'sourceId' => $job['sourceId'] ?? null,
+            'destSourceId' => $job['destSourceId'] ?? null,
+            'crossSource' => !empty($job['crossSource']),
+        ];
     }
 
     /**
@@ -727,6 +842,7 @@ class FileController
             $destSourceId = $useSources
                 ? $this->normalizeSourceId($rawDestId !== '' ? $rawDestId : $sourceId)
                 : '';
+            $asyncRequested = $this->isAsyncRequested($data);
 
             if ($useSources && (($rawSourceId !== '' && $sourceId === '') || ($rawDestId !== '' && $destSourceId === ''))) {
                 $this->jsonOut(["error" => "Invalid source id."], 400);
@@ -818,6 +934,30 @@ class FileController
                     return;
                 }
 
+                if ($asyncRequested) {
+                    $queued = $this->enqueueTransferJob([
+                        'user' => $username,
+                        'kind' => 'file_copy',
+                        'itemType' => 'file',
+                        'mode' => 'copy',
+                        'sourceFolder' => $sourceFolder,
+                        'destinationFolder' => $destinationFolder,
+                        'sourceId' => $sourceId,
+                        'destSourceId' => $destSourceId,
+                        'crossSource' => true,
+                        'files' => $files,
+                        'selectedFiles' => count($files),
+                        'selectedBytes' => is_numeric($data['totalBytes'] ?? null) ? (int)$data['totalBytes'] : 0,
+                    ]);
+                    if (isset($queued['error'])) {
+                        $this->jsonOut(['error' => $queued['error']], 500);
+                        return;
+                    }
+                    $this->jsonOut($queued, 202);
+                    return;
+                }
+
+                $this->releaseSessionLock();
                 $result = FileModel::copyFilesAcrossSources($sourceId, $destSourceId, $sourceFolder, $destinationFolder, $files);
                 if (isset($result['success'])) {
                     foreach ($files as $name) {
@@ -902,7 +1042,31 @@ class FileController
                 return;
             }
 
+            if ($asyncRequested) {
+                $queued = $this->enqueueTransferJob([
+                    'user' => $username,
+                    'kind' => 'file_copy',
+                    'itemType' => 'file',
+                    'mode' => 'copy',
+                    'sourceFolder' => $sourceFolder,
+                    'destinationFolder' => $destinationFolder,
+                    'sourceId' => $sourceId,
+                    'destSourceId' => $destSourceId,
+                    'crossSource' => false,
+                    'files' => $files,
+                    'selectedFiles' => count($files),
+                    'selectedBytes' => is_numeric($data['totalBytes'] ?? null) ? (int)$data['totalBytes'] : 0,
+                ]);
+                if (isset($queued['error'])) {
+                    $this->jsonOut(['error' => $queued['error']], 500);
+                    return;
+                }
+                $this->jsonOut($queued, 202);
+                return;
+            }
+
             // --- Do the copy ----------------------------------------------------
+            $this->releaseSessionLock();
             $result = FileModel::copyFiles($sourceFolder, $destinationFolder, $files);
             if (isset($result['success'])) {
                 foreach ($files as $name) {
@@ -1055,6 +1219,7 @@ class FileController
             $destSourceId = $useSources
                 ? $this->normalizeSourceId($rawDestId !== '' ? $rawDestId : $sourceId)
                 : '';
+            $asyncRequested = $this->isAsyncRequested($data);
 
             if ($useSources && (($rawSourceId !== '' && $sourceId === '') || ($rawDestId !== '' && $destSourceId === ''))) {
                 $this->jsonOut(["error" => "Invalid source id."], 400);
@@ -1154,6 +1319,30 @@ class FileController
                     return;
                 }
 
+                if ($asyncRequested) {
+                    $queued = $this->enqueueTransferJob([
+                        'user' => $username,
+                        'kind' => 'file_move',
+                        'itemType' => 'file',
+                        'mode' => 'move',
+                        'sourceFolder' => $sourceFolder,
+                        'destinationFolder' => $destinationFolder,
+                        'sourceId' => $sourceId,
+                        'destSourceId' => $destSourceId,
+                        'crossSource' => true,
+                        'files' => $files,
+                        'selectedFiles' => count($files),
+                        'selectedBytes' => is_numeric($data['totalBytes'] ?? null) ? (int)$data['totalBytes'] : 0,
+                    ]);
+                    if (isset($queued['error'])) {
+                        $this->jsonOut(['error' => $queued['error']], 500);
+                        return;
+                    }
+                    $this->jsonOut($queued, 202);
+                    return;
+                }
+
+                $this->releaseSessionLock();
                 $result = FileModel::moveFilesAcrossSources($sourceId, $destSourceId, $sourceFolder, $destinationFolder, $files);
                 if (isset($result['success'])) {
                     foreach ($files as $name) {
@@ -1230,7 +1419,31 @@ class FileController
                 }
             }
 
+            if ($asyncRequested) {
+                $queued = $this->enqueueTransferJob([
+                    'user' => $username,
+                    'kind' => 'file_move',
+                    'itemType' => 'file',
+                    'mode' => 'move',
+                    'sourceFolder' => $sourceFolder,
+                    'destinationFolder' => $destinationFolder,
+                    'sourceId' => $sourceId,
+                    'destSourceId' => $destSourceId,
+                    'crossSource' => false,
+                    'files' => $files,
+                    'selectedFiles' => count($files),
+                    'selectedBytes' => is_numeric($data['totalBytes'] ?? null) ? (int)$data['totalBytes'] : 0,
+                ]);
+                if (isset($queued['error'])) {
+                    $this->jsonOut(['error' => $queued['error']], 500);
+                    return;
+                }
+                $this->jsonOut($queued, 202);
+                return;
+            }
+
             // --- Perform move ----------------------------------------------------
+            $this->releaseSessionLock();
             $result = FileModel::moveFiles($sourceFolder, $destinationFolder, $files);
             if (isset($result['success'])) {
                 foreach ($files as $name) {
@@ -1248,6 +1461,190 @@ class FileController
         } catch (Throwable $e) {
             error_log('FileController::moveFiles error: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
             $this->jsonOut(['error' => 'Internal server error while moving files.'], 500);
+        } finally {
+            $this->jsonEnd();
+        }
+    }
+
+    public function transferJobStart(): void
+    {
+        if (session_status() !== PHP_SESSION_ACTIVE) {
+            session_start();
+        }
+        header('Content-Type: application/json; charset=utf-8');
+
+        if (!$this->checkCsrf()) {
+            return;
+        }
+        if (!$this->requireAuth()) {
+            return;
+        }
+
+        $data = $this->readJsonBody();
+        if (!is_array($data) || !$data) {
+            $this->jsonOut(['error' => 'Invalid input.'], 400);
+            return;
+        }
+
+        $kind = strtolower(trim((string)($data['kind'] ?? '')));
+        $payload = isset($data['payload']) && is_array($data['payload']) ? $data['payload'] : $data;
+        $payload['async'] = true;
+        if (!array_key_exists('totalBytes', $payload) && array_key_exists('totalBytes', $data)) {
+            $payload['totalBytes'] = $data['totalBytes'];
+        }
+        if (!array_key_exists('totalFiles', $payload) && array_key_exists('totalFiles', $data)) {
+            $payload['totalFiles'] = $data['totalFiles'];
+        }
+
+        if ($kind === 'file_copy' || $kind === 'file_move') {
+            $this->withJsonBodyOverride($payload, function () use ($kind): void {
+                if ($kind === 'file_copy') {
+                    $this->copyFiles();
+                    return;
+                }
+                $this->moveFiles();
+            });
+            return;
+        }
+
+        if ($kind === 'folder_copy' || $kind === 'folder_move') {
+            if (!isset($payload['mode'])) {
+                $payload['mode'] = $kind === 'folder_copy' ? 'copy' : 'move';
+            }
+            $folderController = new FolderController();
+            $folderController->setJsonBodyOverride($payload);
+            $folderController->moveFolder();
+            return;
+        }
+
+        $this->jsonOut(['error' => 'Invalid transfer kind.'], 400);
+    }
+
+    public function transferJobStatus(): void
+    {
+        $this->jsonStart();
+        try {
+            if (!$this->requireAuth()) {
+                return;
+            }
+
+            $jobId = trim((string)($_GET['jobId'] ?? $_GET['id'] ?? ''));
+            if (!TransferJobManager::isValidId($jobId)) {
+                $this->jsonOut(['error' => 'Invalid job id.'], 400);
+                return;
+            }
+
+            $job = TransferJobManager::load($jobId);
+            if (!is_array($job)) {
+                $this->jsonOut(['error' => 'Job not found.'], 404);
+                return;
+            }
+
+            $username = (string)($_SESSION['username'] ?? '');
+            $perms = $this->loadPerms($username);
+            $isAdmin = $this->isAdmin($perms);
+            $owner = (string)($job['user'] ?? '');
+            if (!$isAdmin && $owner !== '' && strcasecmp($owner, $username) !== 0) {
+                $this->jsonOut(['error' => 'Forbidden.'], 403);
+                return;
+            }
+
+            $this->jsonOut([
+                'ok' => true,
+                'job' => $this->transferJobToPublic($job),
+            ]);
+        } catch (Throwable $e) {
+            error_log('FileController::transferJobStatus error: ' . $e->getMessage());
+            $this->jsonOut(['error' => 'Internal error fetching transfer status.'], 500);
+        } finally {
+            $this->jsonEnd();
+        }
+    }
+
+    public function transferJobList(): void
+    {
+        $this->jsonStart();
+        try {
+            if (!$this->requireAuth()) {
+                return;
+            }
+
+            $username = (string)($_SESSION['username'] ?? '');
+            $perms = $this->loadPerms($username);
+            $isAdmin = $this->isAdmin($perms);
+            $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 50;
+            $jobs = TransferJobManager::listForUser($username, $isAdmin, $limit);
+            $out = array_map(fn(array $job): array => $this->transferJobToPublic($job), $jobs);
+            $this->jsonOut(['ok' => true, 'jobs' => $out]);
+        } catch (Throwable $e) {
+            error_log('FileController::transferJobList error: ' . $e->getMessage());
+            $this->jsonOut(['error' => 'Internal error listing transfer jobs.'], 500);
+        } finally {
+            $this->jsonEnd();
+        }
+    }
+
+    public function transferJobCancel(): void
+    {
+        $this->jsonStart();
+        try {
+            if (!$this->checkCsrf()) {
+                return;
+            }
+            if (!$this->requireAuth()) {
+                return;
+            }
+
+            $data = $this->readJsonBody();
+            $jobId = trim((string)($data['jobId'] ?? $data['id'] ?? ''));
+            if (!TransferJobManager::isValidId($jobId)) {
+                $this->jsonOut(['error' => 'Invalid job id.'], 400);
+                return;
+            }
+
+            $job = TransferJobManager::load($jobId);
+            if (!is_array($job)) {
+                $this->jsonOut(['error' => 'Job not found.'], 404);
+                return;
+            }
+
+            $username = (string)($_SESSION['username'] ?? '');
+            $perms = $this->loadPerms($username);
+            $isAdmin = $this->isAdmin($perms);
+            $owner = (string)($job['user'] ?? '');
+            if (!$isAdmin && $owner !== '' && strcasecmp($owner, $username) !== 0) {
+                $this->jsonOut(['error' => 'Forbidden.'], 403);
+                return;
+            }
+
+            $status = strtolower((string)($job['status'] ?? 'queued'));
+            if (in_array($status, ['done', 'error', 'cancelled'], true)) {
+                $this->jsonOut(['ok' => true, 'job' => $this->transferJobToPublic($job)]);
+                return;
+            }
+
+            if (!TransferJobManager::requestCancel($jobId)) {
+                $this->jsonOut(['error' => 'Failed to cancel job.'], 500);
+                return;
+            }
+
+            $fresh = TransferJobManager::load($jobId) ?: [];
+            $freshStatus = strtolower((string)($fresh['status'] ?? 'queued'));
+            if (in_array($freshStatus, ['queued', 'cancel_requested'], true)) {
+                $fresh['status'] = 'cancelled';
+                $fresh['phase'] = 'cancelled';
+                $fresh['endedAt'] = time();
+                TransferJobManager::save($jobId, $fresh);
+                $fresh = TransferJobManager::load($jobId) ?: $fresh;
+            }
+
+            $this->jsonOut([
+                'ok' => true,
+                'job' => $this->transferJobToPublic($fresh),
+            ]);
+        } catch (Throwable $e) {
+            error_log('FileController::transferJobCancel error: ' . $e->getMessage());
+            $this->jsonOut(['error' => 'Internal error cancelling transfer job.'], 500);
         } finally {
             $this->jsonEnd();
         }
@@ -4372,6 +4769,19 @@ class FileController
                     $folder = implode('/', $parts);
                 }
 
+                $includeContent = $this->truthy($_GET['includeContent'] ?? ($_GET['includeSnippets'] ?? false));
+                $pageSize = isset($_GET['pageSize']) ? (int)$_GET['pageSize'] : 0;
+                if ($pageSize < 0) {
+                    $pageSize = 0;
+                }
+                $cursor = trim((string)($_GET['cursor'] ?? ''));
+                $sortBy = trim((string)($_GET['sortBy'] ?? ''));
+                $sortDir = trim((string)($_GET['sortDir'] ?? ''));
+                $pagingRequested = ($pageSize > 0) || ($cursor !== '');
+                if ($pagingRequested && $pageSize <= 0) {
+                    $pageSize = 50;
+                }
+
                 // ---- Folder-level view checks (full vs own-only) ----
                 // Full view if read OR ancestor owner
                 $fullView     = ACL::canRead($username, $perms, $folder) || $this->ownsFolderOrAncestor($folder, $username, $perms);
@@ -4400,7 +4810,29 @@ class FileController
                 }
 
                 // Fetch the list
-                $result = FileModel::getFileList($folder);
+                $listOptions = [
+                    'includeContent' => $includeContent,
+                ];
+                if ($pagingRequested) {
+                    $listOptions['pageSize'] = $pageSize;
+                    if ($cursor !== '') {
+                        $listOptions['cursor'] = $cursor;
+                    }
+                    if ($sortBy !== '') {
+                        $listOptions['sortBy'] = $sortBy;
+                    }
+                    if ($sortDir !== '') {
+                        $listOptions['sortDir'] = $sortDir;
+                    }
+                }
+
+                $ownOnlyFilteredInModel = false;
+                if ($pagingRequested && !$fullView && $ownOnlyGrant) {
+                    $listOptions['uploaderExact'] = $username;
+                    $ownOnlyFilteredInModel = true;
+                }
+
+                $result = FileModel::getFileList($folder, $listOptions);
                 if ($result === false || $result === null) {
                     http_response_code(500);
                     echo json_encode(['error' => 'File model failed.']);
@@ -4416,7 +4848,7 @@ class FileController
                 }
 
                 // ---- Apply own-only filter if user does NOT have full view ----
-                if (!$fullView && $ownOnlyGrant && isset($result['files'])) {
+                if (!$ownOnlyFilteredInModel && !$fullView && $ownOnlyGrant && isset($result['files'])) {
                     $files = $result['files'];
 
                     // If files keyed by filename (assoc array)

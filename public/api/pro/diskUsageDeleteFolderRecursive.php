@@ -1,7 +1,8 @@
 <?php
+
 // public/api/pro/diskUsageDeleteFolderRecursive.php
 /**
- * @OA\Post(
+ * @OA@Post(
  *   path="/api/pro/diskUsageDeleteFolderRecursive.php",
  *   summary="Permanently delete a folder",
  *   description="Recursively deletes a folder from storage explorer (Pro, admin).",
@@ -29,7 +30,7 @@ declare(strict_types=1);
 header('Content-Type: application/json; charset=utf-8');
 
 require_once __DIR__ . '/../../../config/config.php';
-require_once PROJECT_ROOT . '/src/lib/SourceContext.php';
+require_once PROJECT_ROOT . '/src/FileRise/Domain/SourceAccessService.php';
 
 // Pro-only gate
 if (!defined('FR_PRO_ACTIVE') || !FR_PRO_ACTIVE || !fr_pro_api_level_at_least(FR_PRO_API_REQUIRE_DISK_USAGE)) {
@@ -53,7 +54,7 @@ try {
     \FileRise\Http\Controllers\AdminController::requireAdmin();
     \FileRise\Http\Controllers\AdminController::requireCsrf();
 
-    $raw  = file_get_contents('php://input');
+    $raw = file_get_contents('php://input');
     $body = json_decode($raw, true);
     if (!is_array($body) || !isset($body['folder'])) {
         http_response_code(400);
@@ -63,51 +64,35 @@ try {
 
     $folder = (string)$body['folder'];
     $folder = $folder === '' ? 'root' : trim($folder, "/\\ ");
-
-    $sourceId = isset($body['sourceId']) ? trim((string)$body['sourceId']) : '';
-    $prevSourceId = null;
-    if ($sourceId !== '' && class_exists('SourceContext') && SourceContext::sourcesEnabled()) {
-        if (!preg_match('/^[A-Za-z0-9_-]{1,64}$/', $sourceId)) {
-            http_response_code(400);
-            echo json_encode(['ok' => false, 'error' => 'Invalid source id.']);
-            return;
-        }
-        $src = SourceContext::getSourceById($sourceId);
-        if (!$src || empty($src['enabled'])) {
-            http_response_code(400);
-            echo json_encode(['ok' => false, 'error' => 'Invalid source id.']);
-            return;
-        }
-        $type = strtolower((string)($src['type'] ?? 'local'));
-        if ($type !== 'local') {
-            http_response_code(400);
-            echo json_encode(['ok' => false, 'error' => 'Storage explorer is only available for local sources.']);
-            return;
-        }
-        $prevSourceId = SourceContext::getActiveId();
-        SourceContext::setActiveId($sourceId, false, true);
-    }
-
     if (strtolower($folder) === 'root') {
         http_response_code(400);
         echo json_encode(['ok' => false, 'error' => 'Cannot deep delete root folder.']);
         return;
     }
 
-    try {
+    $sourceId = isset($body['sourceId']) ? trim((string)$body['sourceId']) : '';
+    if ($sourceId !== '') {
+        $res = \FileRise\Domain\SourceAccessService::withLocalExplorerSource($sourceId, static function () use ($folder) {
+            return \FileRise\Domain\FolderModel::deleteFolderRecursiveAdmin($folder);
+        });
+    } else {
         $res = \FileRise\Domain\FolderModel::deleteFolderRecursiveAdmin($folder);
-    } finally {
-        if ($prevSourceId !== null) {
-            SourceContext::setActiveId($prevSourceId, false, true);
-        }
     }
+
     if (!empty($res['error'])) {
         echo json_encode(['ok' => false, 'error' => $res['error']]);
     } else {
         echo json_encode(['ok' => true, 'success' => $res['success'] ?? 'Folder deleted.']);
     }
 } catch (Throwable $e) {
-    error_log('diskUsageDeleteFolderRecursive error: '.$e->getMessage());
+    $code = (int)$e->getCode();
+    if ($code >= 400 && $code <= 599) {
+        http_response_code($code);
+        echo json_encode(['ok' => false, 'error' => $e->getMessage()]);
+        return;
+    }
+
+    error_log('diskUsageDeleteFolderRecursive error: ' . $e->getMessage());
     http_response_code(500);
     echo json_encode(['ok' => false, 'error' => 'Internal error']);
 }

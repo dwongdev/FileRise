@@ -2,7 +2,7 @@
 import { showToast, escapeHTML } from './domUtils.js?v={{APP_QVER}}';
 import { loadFileList, cancelHoverPreview, repairBlankFolderIcons } from './fileListView.js?v={{APP_QVER}}';
 import { t } from './i18n.js?v={{APP_QVER}}';
-import { startTransferProgress, finishTransferProgress } from './transferProgress.js?v={{APP_QVER}}';
+import { runTransferJob } from './transferJobs.js?v={{APP_QVER}}';
 import {
   getParentFolder,
   syncTreeAfterFolderMove,
@@ -18,6 +18,36 @@ function parentFolderOf(path) {
   if (parts.length <= 1) return 'root';
   parts.pop();
   return parts.join('/');
+}
+
+function normalizeFolderToastKey(path) {
+  const raw = String(path || '').trim();
+  if (!raw || raw.toLowerCase() === 'root') return 'root';
+  return raw;
+}
+
+function formatFolderPathForToast(path) {
+  const key = normalizeFolderToastKey(path);
+  return key === 'root' ? (t('root_folder') || 'Root') : key;
+}
+
+function movedFolderNameForToast(path) {
+  const key = normalizeFolderToastKey(path);
+  if (key === 'root') return t('root_folder') || 'Root';
+  const parts = key.split('/').filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : key;
+}
+
+function buildMoveFolderSuccessToast(sourceFolder, destinationFolder) {
+  const movedName = movedFolderNameForToast(sourceFolder);
+  const sourceParent = normalizeFolderToastKey(parentFolderOf(sourceFolder));
+  const destFolder = normalizeFolderToastKey(destinationFolder);
+  const destLabel = formatFolderPathForToast(destFolder);
+  if (sourceParent !== destFolder) {
+    const sourceLabel = formatFolderPathForToast(sourceParent);
+    return t('move_folder_success_named_from_to', { name: movedName, source: sourceLabel, folder: destLabel });
+  }
+  return t('move_folder_success_named_to', { name: movedName, folder: destLabel });
 }
 
 function invalidateFolderStats(folders, sourceId = '') {
@@ -305,46 +335,25 @@ export async function folderDropHandler(event) {
       return;
     }
 
-    const progress = startTransferProgress({
-      action: 'Moving',
-      itemCount: 1,
-      itemLabel: 'folder',
-      bytesKnown: false,
-      indeterminate: true,
-      source,
-      destination
-    });
-    let ok = false;
-    let errMsg = '';
-
     try {
-      const res = await fetch('/api/folder/moveFolder.php', {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'X-CSRF-Token': window.csrfToken
-        },
-        body: JSON.stringify({
-          source,        // full folder path
-          destination,   // parent or "root"
+      await runTransferJob({
+        kind: 'folder_move',
+        payload: {
+          source,
+          destination,
           sourceId,
           destSourceId
-        })
+        },
+        progress: {
+          action: 'Moving',
+          itemCount: 1,
+          itemLabel: 'folder',
+          bytesKnown: false,
+          indeterminate: true,
+          source,
+          destination
+        }
       });
-
-      const text = await res.text();
-      let data = {};
-      try { data = text ? JSON.parse(text) : {}; } catch (e) { /* ignore double-echo edge cases */ }
-
-      if (!res.ok || (data && data.error)) {
-        const msg = (data && data.error) || text || `HTTP ${res.status}`;
-        ok = false;
-        errMsg = msg || t('move_folder_error_default');
-        showToast(t('move_folder_error_detail', { error: errMsg }), 'error');
-        return;
-      }
 
       const oldParent = getParentFolder(source);
       const dstParent = destination || 'root';
@@ -358,9 +367,7 @@ export async function folderDropHandler(event) {
         invalidateFolderStats([oldParent, dstParent], statSourceId);
       }
 
-      const destLabel = dstParent || t('root_folder');
-      showToast(t('move_folder_success_to', { folder: destLabel }));
-      ok = true;
+      showToast(buildMoveFolderSuccessToast(source, dstParent), 'success');
 
       if (crossSource) {
         loadFileList(dstParent).finally(scheduleBlankFolderIconRepair);
@@ -371,12 +378,9 @@ export async function folderDropHandler(event) {
       }
 
     } catch (e) {
-      ok = false;
-      errMsg = e && e.message ? e.message : t('move_folder_error_default');
+      const errMsg = e && e.message ? e.message : t('move_folder_error_default');
       console.error('Error moving folder:', e);
-      showToast(t('move_folder_error'), 'error');
-    } finally {
-      finishTransferProgress(progress, { ok, error: errMsg });
+      showToast(t('move_folder_error_detail', { error: errMsg }), 'error');
     }
 
     return;
@@ -413,71 +417,50 @@ export async function folderDropHandler(event) {
     bytesKnown: dragData.bytesKnown === true,
     itemCount: names.length
   };
-  const progress = startTransferProgress({
-    action: 'Moving',
-    itemCount: totals.itemCount,
-    itemLabel: totals.itemCount === 1 ? 'file' : 'files',
-    totalBytes: totals.totalBytes,
-    bytesKnown: totals.bytesKnown,
-    source: sourceFolder,
-    destination: dropFolder
-  });
-  let ok = false;
-  let errMsg = '';
-
   try {
-    const res = await fetch('/api/file/moveFiles.php', {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'X-CSRF-Token': window.csrfToken
-      },
-      body: JSON.stringify({
+    await runTransferJob({
+      kind: 'file_move',
+      payload: {
         source: sourceFolder,
         files: names,
         destination: dropFolder,
         sourceId,
-        destSourceId
-      })
+        destSourceId,
+        totalBytes: totals.totalBytes
+      },
+      progress: {
+        action: 'Moving',
+        itemCount: totals.itemCount,
+        itemLabel: totals.itemCount === 1 ? 'file' : 'files',
+        totalBytes: totals.totalBytes,
+        bytesKnown: totals.bytesKnown,
+        source: sourceFolder,
+        destination: dropFolder
+      }
     });
 
-    const data = await res.json().catch(() => ({}));
+    const destLabel = dropFolder || t('root_folder');
+    const msg = (names.length === 1)
+      ? t('move_file_success_to', { name: names[0], folder: destLabel })
+      : t('move_files_success_to', { count: names.length, folder: destLabel });
+    showToast(msg, 'success');
 
-    if (res.ok && data && data.success) {
-      ok = true;
-      const destLabel = dropFolder || t('root_folder');
-      const msg = (names.length === 1)
-        ? t('move_file_success_to', { name: names[0], folder: destLabel })
-        : t('move_files_success_to', { count: names.length, folder: destLabel });
-      showToast(msg);
-
-      // keep stats fresh for source + dest
-      if (crossSource) {
-        invalidateFolderStats([sourceFolder], sourceId);
-        invalidateFolderStats([dropFolder], destSourceId);
-      } else {
-        const statSourceId = sourceId || destSourceId;
-        invalidateFolderStats([sourceFolder, dropFolder], statSourceId);
-      }
-
-      const reloadFolder = crossSource
-        ? (window.currentFolder || dropFolder || sourceFolder)
-        : (window.currentFolder || sourceFolder);
-      loadFileList(reloadFolder).finally(scheduleBlankFolderIconRepair);
+    // keep stats fresh for source + dest
+    if (crossSource) {
+      invalidateFolderStats([sourceFolder], sourceId);
+      invalidateFolderStats([dropFolder], destSourceId);
     } else {
-      const err = (data && (data.error || data.message)) || `HTTP ${res.status}`;
-      ok = false;
-      errMsg = err;
-      showToast(t('move_files_error', { error: err }), 'error');
+      const statSourceId = sourceId || destSourceId;
+      invalidateFolderStats([sourceFolder, dropFolder], statSourceId);
     }
+
+    const reloadFolder = crossSource
+      ? (window.currentFolder || dropFolder || sourceFolder)
+      : (window.currentFolder || sourceFolder);
+    loadFileList(reloadFolder).finally(scheduleBlankFolderIconRepair);
   } catch (e) {
-    ok = false;
-    errMsg = e && e.message ? e.message : t('move_files_error_default');
+    const errMsg = e && e.message ? e.message : t('move_files_error_default');
     console.error('Error moving file(s):', e);
-    showToast(t('move_files_error_generic'), 'error');
-  } finally {
-    finishTransferProgress(progress, { ok, error: errMsg });
+    showToast(t('move_files_error', { error: errMsg }), 'error');
   }
 }

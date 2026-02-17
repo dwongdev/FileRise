@@ -12,6 +12,7 @@ import { refreshFolderIcon, updateRecycleBinState } from './folderManager.js?v={
 import { t } from './i18n.js?v={{APP_QVER}}';
 import { withBase } from './basePath.js?v={{APP_QVER}}';
 import { startTransferProgress, finishTransferProgress } from './transferProgress.js?v={{APP_QVER}}';
+import { runTransferJob } from './transferJobs.js?v={{APP_QVER}}';
 
 function getActiveFileListRoot() {
   return document.getElementById("fileList") || document;
@@ -1139,55 +1140,40 @@ document.addEventListener("DOMContentLoaded", function () {
       }
       const selection = Array.isArray(window.filesToCopy) ? window.filesToCopy : [];
       const totals = getTransferTotalsForNames(selection);
-      const progress = startTransferProgress({
-        action: 'Copying',
-        itemCount: totals.itemCount,
-        itemLabel: totals.itemCount === 1 ? 'file' : 'files',
-        totalBytes: totals.totalBytes,
-        bytesKnown: totals.bytesKnown,
-        source: window.currentFolder || 'root',
-        destination: targetFolder
-      });
-      let ok = false;
-      let errMsg = '';
-      fetch("/api/file/copyFiles.php", {
-        method: "POST",
-        credentials: "include",
-        headers: {
-          "Content-Type": "application/json",
-          "X-CSRF-Token": window.csrfToken
-        },
-        body: JSON.stringify({
+      runTransferJob({
+        kind: 'file_copy',
+        payload: {
           source: window.currentFolder,
           files: window.filesToCopy,
           destination: targetFolder,
           sourceId,
-          destSourceId
-        })
+          destSourceId,
+          totalBytes: totals.totalBytes
+        },
+        progress: {
+          action: 'Copying',
+          itemCount: totals.itemCount,
+          itemLabel: totals.itemCount === 1 ? 'file' : 'files',
+          totalBytes: totals.totalBytes,
+          bytesKnown: totals.bytesKnown,
+          source: window.currentFolder || 'root',
+          destination: targetFolder
+        }
       })
-        .then(response => response.json())
-        .then(data => {
-          if (data.success) {
-            ok = true;
-            showToast(t('copy_files_success'), 5000, 'success');
-            loadFileList(window.currentFolder);
-            if (!destSourceId || destSourceId === sourceId) {
-              refreshFolderIcon(targetFolder);
-            }
-            markPaneNeedsReloadForFolder(targetFolder, destSourceId);
-          } else {
-            ok = false;
-            errMsg = data.error || t('copy_files_error_default');
-            showToast(t('copy_files_error', { error: errMsg }), 5000, 'error');
+        .then(() => {
+          showToast(t('copy_files_success'), 5000, 'success');
+          loadFileList(window.currentFolder);
+          if (!destSourceId || destSourceId === sourceId) {
+            refreshFolderIcon(targetFolder);
           }
+          markPaneNeedsReloadForFolder(targetFolder, destSourceId);
         })
         .catch(error => {
-          ok = false;
-          errMsg = error && error.message ? error.message : t('copy_files_error_default');
+          const errMsg = error && error.message ? error.message : t('copy_files_error_default');
           console.error("Error copying files:", error);
+          showToast(t('copy_files_error', { error: errMsg }), 5000, 'error');
         })
         .finally(() => {
-          finishTransferProgress(progress, { ok, error: errMsg });
           document.getElementById("copyFilesModal").style.display = "none";
           window.filesToCopy = [];
         });
@@ -1218,62 +1204,62 @@ document.addEventListener("DOMContentLoaded", function () {
         showToast(t('move_same_folder_error'), 'error');
         return;
       }
+      const moveModal = document.getElementById("moveFilesModal");
+      if (moveModal) {
+        moveModal.style.display = "none";
+      }
       const selection = Array.isArray(window.filesToMove) ? window.filesToMove : [];
       const totals = getTransferTotalsForNames(selection);
-      const progress = startTransferProgress({
-        action: 'Moving',
-        itemCount: totals.itemCount,
-        itemLabel: totals.itemCount === 1 ? 'file' : 'files',
-        totalBytes: totals.totalBytes,
-        bytesKnown: totals.bytesKnown,
-        source: window.currentFolder || 'root',
-        destination: targetFolder
-      });
-      let ok = false;
-      let errMsg = '';
-      fetch("/api/file/moveFiles.php", {
-        method: "POST",
-        credentials: "include",
-        headers: {
-          "Content-Type": "application/json",
-          "X-CSRF-Token": window.csrfToken
-        },
-        body: JSON.stringify({
+      runTransferJob({
+        kind: 'file_move',
+        payload: {
           source: window.currentFolder,
           files: window.filesToMove,
           destination: targetFolder,
           sourceId,
-          destSourceId
-        })
+          destSourceId,
+          totalBytes: totals.totalBytes
+        },
+        progress: {
+          action: 'Moving',
+          itemCount: totals.itemCount,
+          itemLabel: totals.itemCount === 1 ? 'file' : 'files',
+          totalBytes: totals.totalBytes,
+          bytesKnown: totals.bytesKnown,
+          source: window.currentFolder || 'root',
+          destination: targetFolder
+        }
       })
-        .then(response => response.json())
-        .then(data => {
-          if (data.success) {
-            ok = true;
-            showToast(t('move_files_success'), 'success');
-            loadFileList(window.currentFolder);
-            if (!destSourceId || destSourceId === sourceId) {
-              refreshFolderIcon(targetFolder);
-              refreshFolderIcon(window.currentFolder);
-            } else {
-              refreshFolderIcon(window.currentFolder);
-            }
-            markPaneNeedsReloadForFolder(targetFolder, destSourceId);
-            markPaneNeedsReloadForFolder(window.currentFolder, sourceId);
+        .then(() => {
+          const movedNames = selection
+            .map(name => String(name || '').trim())
+            .filter(Boolean);
+          const destLabel = targetFolder || (t('root_folder') || 'root');
+          if (movedNames.length === 1) {
+            showToast(t('move_file_success_to', { name: movedNames[0], folder: destLabel }), 'success');
           } else {
-            ok = false;
-            errMsg = data.error || t('move_files_error_default');
-            showToast(t('move_files_error', { error: errMsg }), 'error');
+            showToast(t('move_files_success_to', { count: movedNames.length, folder: destLabel }), 'success');
           }
+          loadFileList(window.currentFolder);
+          if (!destSourceId || destSourceId === sourceId) {
+            refreshFolderIcon(targetFolder);
+            refreshFolderIcon(window.currentFolder);
+          } else {
+            refreshFolderIcon(window.currentFolder);
+          }
+          markPaneNeedsReloadForFolder(targetFolder, destSourceId);
+          markPaneNeedsReloadForFolder(window.currentFolder, sourceId);
         })
         .catch(error => {
-          ok = false;
-          errMsg = error && error.message ? error.message : t('move_files_error_default');
+          if (error && error.cancelled) {
+            showToast(t('transfer_cancelled') || 'Transfer cancelled.', 'info');
+            return;
+          }
+          const errMsg = error && error.message ? error.message : t('move_files_error_default');
           console.error("Error moving files:", error);
+          showToast(t('move_files_error', { error: errMsg }), 'error');
         })
         .finally(() => {
-          finishTransferProgress(progress, { ok, error: errMsg });
-          document.getElementById("moveFilesModal").style.display = "none";
           window.filesToMove = [];
         });
     });
