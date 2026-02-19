@@ -4980,25 +4980,82 @@ function loadShareLinksSection() {
   ])
     .then(([folders, files]) => {
       const esc = (val) => escapeHTML(val == null ? "" : String(val));
-      const hasAny = Object.keys(folders).length || Object.keys(files).length;
+      const asMap = (obj) => (obj && typeof obj === "object" && !Array.isArray(obj)) ? obj : {};
+      const folderMap = asMap(folders);
+      const fileMap = asMap(files);
+
+      const truthy = (v) => {
+        if (v === true || v === 1) return true;
+        const s = String(v ?? "").trim().toLowerCase();
+        return s === "1" || s === "true" || s === "yes" || s === "on";
+      };
+      const isFileRequest = (record) => {
+        if (!record || typeof record !== "object") return false;
+        const mode = String(record.mode || "").toLowerCase();
+        return mode === "drop" || truthy(record.fileDrop) || truthy(record.fileDropMode) || truthy(record.hideListing);
+      };
+      const creatorOf = (record) => {
+        if (!record || typeof record !== "object") return "";
+        const candidates = [record.createdBy, record.created_by, record.startedBy, record.user, record.username];
+        for (const val of candidates) {
+          if (typeof val === "string" && val.trim() !== "") {
+            return val.trim();
+          }
+        }
+        return "";
+      };
+      const sourceHtmlFor = (record) => {
+        const sourceLabel = record?.sourceName || record?.sourceId || "";
+        if (!sourceLabel || sourceLabel.toLowerCase() === "local") {
+          return "";
+        }
+        return ` <small class="text-muted">[${esc(sourceLabel)}]</small>`;
+      };
+      const creatorHtmlFor = (record) => {
+        const creator = creatorOf(record);
+        if (!creator) {
+          return "";
+        }
+        return ` <small class="text-muted">${esc(t("shared_created_by", { user: creator }))}</small>`;
+      };
+      const expiryHtmlFor = (record) => {
+        const expires = Number(record?.expires || 0);
+        if (!Number.isFinite(expires) || expires <= 0) {
+          return "";
+        }
+        return ` <small>(${esc(new Date(expires * 1000).toLocaleString())})</small>`;
+      };
+
+      const folderEntries = Object.entries(folderMap).filter(([, o]) => o && typeof o === "object");
+      const fileEntries = Object.entries(fileMap).filter(([, o]) => o && typeof o === "object");
+      const folderShareEntries = [];
+      const fileRequestEntries = [];
+      folderEntries.forEach((entry) => {
+        if (isFileRequest(entry[1])) {
+          fileRequestEntries.push(entry);
+        } else {
+          folderShareEntries.push(entry);
+        }
+      });
+
+      const hasAny = folderShareEntries.length || fileRequestEntries.length || fileEntries.length;
       if (!hasAny) {
         container.innerHTML = `<p>${t("no_shared_links_available")}</p>`;
         return;
       }
 
-      let html = `<h5>${t("folder_shares")}</h5><ul>`;
-      Object.entries(folders).forEach(([token, o]) => {
+      const emptyItem = `<li><small class="text-muted">${esc(t("none"))}</small></li>`;
+      let html = `<h5>${esc(t("folder_shares"))}</h5><ul>`;
+      if (folderShareEntries.length === 0) {
+        html += emptyItem;
+      }
+      folderShareEntries.forEach(([token, o]) => {
         const lock = o.password ? "🔒 " : "";
         const tokenValue = o.token || token;
-        const sourceLabel = o.sourceName || o.sourceId || "";
-        const sourceHtml = sourceLabel && sourceLabel.toLowerCase() !== "local"
-          ? ` <small class="text-muted">[${esc(sourceLabel)}]</small>`
-          : "";
         const folderLabel = esc(o.folder || "root");
         html += `
           <li>
-            ${lock}<strong>${folderLabel}</strong>${sourceHtml}
-            <small>(${new Date(o.expires * 1000).toLocaleString()})</small>
+            ${lock}<strong>${folderLabel}</strong>${sourceHtmlFor(o)}${creatorHtmlFor(o)}${expiryHtmlFor(o)}
             <button type="button"
                     data-key="${esc(tokenValue)}"
                     data-source-id="${esc(o.sourceId || "")}"
@@ -5007,21 +5064,38 @@ function loadShareLinksSection() {
           </li>`;
       });
 
-      html += `</ul><h5 style="margin-top:1em;">${t("file_shares")}</h5><ul>`;
-      Object.entries(files).forEach(([token, o]) => {
+      html += `</ul><h5 style="margin-top:1em;">${esc(t("file_requests"))}</h5><ul>`;
+      if (fileRequestEntries.length === 0) {
+        html += emptyItem;
+      }
+      fileRequestEntries.forEach(([token, o]) => {
         const lock = o.password ? "🔒 " : "";
         const tokenValue = o.token || token;
-        const sourceLabel = o.sourceName || o.sourceId || "";
-        const sourceHtml = sourceLabel && sourceLabel.toLowerCase() !== "local"
-          ? ` <small class="text-muted">[${esc(sourceLabel)}]</small>`
-          : "";
+        const folderLabel = esc(o.folder || "root");
+        html += `
+          <li>
+            ${lock}<strong>${folderLabel}</strong>${sourceHtmlFor(o)}${creatorHtmlFor(o)}${expiryHtmlFor(o)}
+            <button type="button"
+                    data-key="${esc(tokenValue)}"
+                    data-source-id="${esc(o.sourceId || "")}"
+                    data-type="folder"
+                    class="btn btn-sm btn-link delete-share">🗑️</button>
+          </li>`;
+      });
+
+      html += `</ul><h5 style="margin-top:1em;">${esc(t("file_shares"))}</h5><ul>`;
+      if (fileEntries.length === 0) {
+        html += emptyItem;
+      }
+      fileEntries.forEach(([token, o]) => {
+        const lock = o.password ? "🔒 " : "";
+        const tokenValue = o.token || token;
         const folderLabel = esc(o.folder || "root");
         const fileLabel = esc(o.file || "");
         const pathLabel = fileLabel ? `${folderLabel}/${fileLabel}` : folderLabel;
         html += `
           <li>
-            ${lock}<strong>${pathLabel}</strong>${sourceHtml}
-            <small>(${new Date(o.expires * 1000).toLocaleString()})</small>
+            ${lock}<strong>${pathLabel}</strong>${sourceHtmlFor(o)}${creatorHtmlFor(o)}${expiryHtmlFor(o)}
             <button type="button"
                     data-key="${esc(tokenValue)}"
                     data-source-id="${esc(o.sourceId || "")}"

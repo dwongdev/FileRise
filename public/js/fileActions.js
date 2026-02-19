@@ -1311,6 +1311,24 @@ export function handleShareSelected(e) {
     .catch(err => console.error("Failed to open share modal", err));
 }
 
+export function handleLinkSelected(e) {
+  if (e) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }
+  const files = getSelectedFileObjects();
+  if (files.length !== 1) {
+    showToast(t("select_single_file") || "Select one file to link.", 'warning');
+    return;
+  }
+  const fileObj = files[0];
+  const folder = fileObj.folder || window.currentFolder || "root";
+
+  import('./fileLink.js?v={{APP_QVER}}')
+    .then(mod => mod.openFileLinkModal(fileObj, folder))
+    .catch(err => console.error("Failed to open file link modal", err));
+}
+
 export async function handleToolbarMenuOpen(e) {
   if (e) {
     e.preventDefault();
@@ -1450,6 +1468,11 @@ export function initFileActions() {
   if (shareSelectedBtn) {
     shareSelectedBtn.replaceWith(shareSelectedBtn.cloneNode(true));
     document.getElementById("shareSelectedBtn").addEventListener("click", handleShareSelected);
+  }
+  const linkSelectedBtn = document.getElementById("linkSelectedBtn");
+  if (linkSelectedBtn) {
+    linkSelectedBtn.replaceWith(linkSelectedBtn.cloneNode(true));
+    document.getElementById("linkSelectedBtn").addEventListener("click", handleLinkSelected);
   }
   const toolbarMenuBtn = document.getElementById("toolbarMenuBtn");
   if (toolbarMenuBtn) {

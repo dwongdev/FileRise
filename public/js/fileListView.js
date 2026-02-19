@@ -5540,6 +5540,10 @@ async function navigateToSearchResult(folder, name, sourceId) {
   setTimeout(() => maybeHighlightSearchedFile(dest), 500);
 }
 
+export async function navigateToLinkedFile(folder, name, sourceId) {
+  await navigateToSearchResult(folder, name, sourceId);
+}
+
   function bindFolderToolbarActions() {
     const map = [
       { id: "folderMoveInlineBtn",   handler: (folder) => openMoveFolderUI(folder) },

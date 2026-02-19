@@ -32,6 +32,14 @@ require_once PROJECT_ROOT . '/src/lib/SourceContext.php';
 
 class FolderController
 {
+    private const SHARE_RATE_WINDOW_SECONDS = 60;
+    private const SHARE_RATE_MAX_REQUESTS_PER_WINDOW = 180;
+    private const SHARE_RATE_MAX_CONCURRENT = 4;
+    private const SHARE_RATE_ACTIVE_TTL_SECONDS = 300;
+    private const SHARE_DAILY_STATE_KEEP_DAYS = 14;
+    private const SHARE_UPLOAD_LOG_MAX_BYTES = 5242880;
+    private const SHARE_UPLOAD_LOG_MAX_FILES = 3;
+
     private ?array $jsonBodyOverride = null;
 
     /* -------------------- Session / Header helpers -------------------- */
@@ -58,6 +66,32 @@ class FolderController
             }
         }
         return $headers;
+    }
+
+    private static function getQueryString(string $key): string
+    {
+        $value = $_GET[$key] ?? '';
+        if (is_array($value)) {
+            return '';
+        }
+        $clean = preg_replace('/[\x00-\x1F\x7F]/', '', trim((string)$value));
+        return is_string($clean) ? $clean : '';
+    }
+
+    private static function getQueryInt(string $key): ?int
+    {
+        $value = $_GET[$key] ?? null;
+        if ($value === null || $value === '') {
+            return null;
+        }
+        if (is_array($value)) {
+            return null;
+        }
+        $raw = trim((string)$value);
+        if (!preg_match('/^-?\d+$/', $raw)) {
+            return null;
+        }
+        return (int)$raw;
     }
 
     private function normalizeSourceId($id): string
@@ -94,6 +128,527 @@ class FolderController
         }
         $s = strtolower(trim((string)$value));
         return in_array($s, ['1', 'true', 'yes', 'on'], true);
+    }
+
+    private static function shareTokenFingerprint(string $token): string
+    {
+        return substr(hash('sha256', $token), 0, 24);
+    }
+
+    private static function defaultSharedAllowedTypes(): array
+    {
+        return [
+            'jpg', 'jpeg', 'png', 'gif', 'pdf', 'doc', 'docx', 'txt', 'xls', 'xlsx',
+            'ppt', 'pptx', 'mp4', 'webm', 'mp3', 'mkv', 'csv', 'json', 'xml', 'md'
+        ];
+    }
+
+    private static function normalizeSharedAllowedTypes($raw): array
+    {
+        $items = [];
+        if (is_string($raw)) {
+            $items = preg_split('/[\s,;]+/', $raw) ?: [];
+        } elseif (is_array($raw)) {
+            $items = $raw;
+        }
+
+        $out = [];
+        foreach ($items as $item) {
+            $ext = strtolower(trim((string)$item));
+            $ext = ltrim($ext, '.');
+            if ($ext === '') {
+                continue;
+            }
+            if (!preg_match('/^[a-z0-9][a-z0-9._+-]{0,31}$/', $ext)) {
+                continue;
+            }
+            $out[$ext] = $ext;
+        }
+        return array_values($out);
+    }
+
+    private static function validateSharedUploadRules(array $record, string $filename, int $sizeBytes): ?string
+    {
+        $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+        if ($ext === 'svg' || $ext === 'svgz') {
+            return 'Upload blocked: SVG files are not allowed in shared folders.';
+        }
+
+        $maxBytes = 50 * 1024 * 1024;
+        $maxFileSizeMb = isset($record['maxFileSizeMb']) && is_numeric($record['maxFileSizeMb'])
+            ? (int)$record['maxFileSizeMb']
+            : 0;
+        if ($maxFileSizeMb > 0) {
+            $maxBytes = $maxFileSizeMb * 1024 * 1024;
+        } else {
+            $adminConfig = AdminModel::getConfig();
+            if (isset($adminConfig['sharedMaxUploadSize']) && is_numeric($adminConfig['sharedMaxUploadSize'])) {
+                $cfgBytes = (int)$adminConfig['sharedMaxUploadSize'];
+                if ($cfgBytes > 0) {
+                    $maxBytes = $cfgBytes;
+                }
+            }
+        }
+        if ($sizeBytes > 0 && $sizeBytes > $maxBytes) {
+            return 'File size exceeds allowed limit.';
+        }
+
+        $allowedTypes = self::normalizeSharedAllowedTypes($record['allowedTypes'] ?? []);
+        if (empty($allowedTypes)) {
+            $allowedTypes = self::defaultSharedAllowedTypes();
+        }
+        if ($ext === '' || !in_array($ext, $allowedTypes, true)) {
+            return 'File type not allowed.';
+        }
+
+        return null;
+    }
+
+    private static function getShareStateDir(): string
+    {
+        $metaRoot = class_exists('SourceContext')
+            ? SourceContext::metaRoot()
+            : rtrim((string)META_DIR, '/\\') . DIRECTORY_SEPARATOR;
+        $dir = rtrim($metaRoot, '/\\') . DIRECTORY_SEPARATOR . 'share_upload_state';
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+        return $dir;
+    }
+
+    private static function withLockedJsonState(string $path, callable $mutator): void
+    {
+        $fp = @fopen($path, 'c+');
+        if ($fp === false) {
+            return;
+        }
+        try {
+            if (!@flock($fp, LOCK_EX)) {
+                return;
+            }
+            $raw = stream_get_contents($fp);
+            $state = [];
+            if (is_string($raw) && trim($raw) !== '') {
+                $decoded = json_decode($raw, true);
+                if (is_array($decoded)) {
+                    $state = $decoded;
+                }
+            }
+            $next = $mutator($state);
+            if (!is_array($next)) {
+                $next = $state;
+            }
+            @ftruncate($fp, 0);
+            @rewind($fp);
+            @fwrite($fp, json_encode($next, JSON_PRETTY_PRINT));
+            @fflush($fp);
+            @flock($fp, LOCK_UN);
+        } finally {
+            @fclose($fp);
+        }
+    }
+
+    private static function applySharedUploadRateLimit(string $tokenHash, string $ip): ?array
+    {
+        $dir = self::getShareStateDir();
+        $path = rtrim($dir, '/\\') . DIRECTORY_SEPARATOR . 'rate_limits.json';
+        $now = time();
+        $windowStart = $now - self::SHARE_RATE_WINDOW_SECONDS;
+        $activeCutoff = $now - self::SHARE_RATE_ACTIVE_TTL_SECONDS;
+        $key = $tokenHash . '|' . $ip;
+        try {
+            $slotId = bin2hex(random_bytes(8));
+        } catch (\Throwable $e) {
+            $slotId = substr(hash('sha256', uniqid('', true)), 0, 16);
+        }
+
+        $decision = ['ok' => true, 'retryAfter' => 0];
+        self::withLockedJsonState($path, function (array $state) use ($key, $slotId, $now, $windowStart, $activeCutoff, &$decision) {
+            $hits = isset($state['hits']) && is_array($state['hits']) ? $state['hits'] : [];
+            $active = isset($state['active']) && is_array($state['active']) ? $state['active'] : [];
+
+            foreach ($hits as $k => $arr) {
+                if (!is_array($arr)) {
+                    unset($hits[$k]);
+                    continue;
+                }
+                $hits[$k] = array_values(array_filter($arr, function ($ts) use ($windowStart) {
+                    return is_numeric($ts) && (int)$ts >= $windowStart;
+                }));
+                if (empty($hits[$k])) {
+                    unset($hits[$k]);
+                }
+            }
+            foreach ($active as $k => $slots) {
+                if (!is_array($slots)) {
+                    unset($active[$k]);
+                    continue;
+                }
+                foreach ($slots as $sid => $ts) {
+                    if (!is_numeric($ts) || (int)$ts < $activeCutoff) {
+                        unset($slots[$sid]);
+                    }
+                }
+                if (empty($slots)) {
+                    unset($active[$k]);
+                } else {
+                    $active[$k] = $slots;
+                }
+            }
+
+            $keyHits = $hits[$key] ?? [];
+            if (count($keyHits) >= self::SHARE_RATE_MAX_REQUESTS_PER_WINDOW) {
+                $oldest = min(array_map(static fn($v) => (int)$v, $keyHits));
+                $retryAfter = max(1, self::SHARE_RATE_WINDOW_SECONDS - max(0, $now - $oldest));
+                $decision = ['ok' => false, 'retryAfter' => $retryAfter];
+                $state['hits'] = $hits;
+                $state['active'] = $active;
+                return $state;
+            }
+
+            $keyActive = $active[$key] ?? [];
+            if (count($keyActive) >= self::SHARE_RATE_MAX_CONCURRENT) {
+                $decision = ['ok' => false, 'retryAfter' => 1];
+                $state['hits'] = $hits;
+                $state['active'] = $active;
+                return $state;
+            }
+
+            $keyHits[] = $now;
+            $hits[$key] = $keyHits;
+            $keyActive[$slotId] = $now;
+            $active[$key] = $keyActive;
+
+            $state['hits'] = $hits;
+            $state['active'] = $active;
+            return $state;
+        });
+
+        if (empty($decision['ok'])) {
+            return [
+                'error' => 'Too many upload requests for this link. Please retry shortly.',
+                'retryAfter' => max(1, (int)($decision['retryAfter'] ?? 1)),
+            ];
+        }
+
+        register_shutdown_function(function () use ($path, $key, $slotId): void {
+            self::withLockedJsonState($path, function (array $state) use ($key, $slotId) {
+                if (!isset($state['active']) || !is_array($state['active'])) {
+                    return $state;
+                }
+                if (isset($state['active'][$key]) && is_array($state['active'][$key])) {
+                    unset($state['active'][$key][$slotId]);
+                    if (empty($state['active'][$key])) {
+                        unset($state['active'][$key]);
+                    }
+                }
+                return $state;
+            });
+        });
+
+        return null;
+    }
+
+    private static function checkSharedDailyQuota(array $record, string $tokenHash, int $sizeBytes): ?string
+    {
+        $dailyFileLimit = isset($record['dailyFileLimit']) && is_numeric($record['dailyFileLimit'])
+            ? max(0, (int)$record['dailyFileLimit'])
+            : 0;
+        $maxTotalMbPerDay = isset($record['maxTotalMbPerDay']) && is_numeric($record['maxTotalMbPerDay'])
+            ? max(0, (int)$record['maxTotalMbPerDay'])
+            : 0;
+        if ($dailyFileLimit <= 0 && $maxTotalMbPerDay <= 0) {
+            return null;
+        }
+
+        $path = rtrim(self::getShareStateDir(), '/\\') . DIRECTORY_SEPARATOR . 'daily_quota.json';
+        $today = gmdate('Y-m-d');
+        $maxTotalBytes = ($maxTotalMbPerDay > 0) ? ($maxTotalMbPerDay * 1024 * 1024) : 0;
+        $error = null;
+
+        self::withLockedJsonState($path, function (array $state) use ($today, $tokenHash, $dailyFileLimit, $maxTotalBytes, $sizeBytes, &$error) {
+            $tokens = isset($state['tokens']) && is_array($state['tokens']) ? $state['tokens'] : [];
+            $keepDays = self::SHARE_DAILY_STATE_KEEP_DAYS;
+            $cutoff = gmdate('Y-m-d', strtotime('-' . max(1, $keepDays) . ' days'));
+
+            foreach ($tokens as $tk => $bucket) {
+                if (!is_array($bucket)) {
+                    unset($tokens[$tk]);
+                    continue;
+                }
+                $days = isset($bucket['days']) && is_array($bucket['days']) ? $bucket['days'] : [];
+                foreach ($days as $day => $row) {
+                    if (!is_string($day) || $day < $cutoff) {
+                        unset($days[$day]);
+                    }
+                }
+                if (empty($days)) {
+                    unset($tokens[$tk]);
+                } else {
+                    $tokens[$tk] = ['days' => $days];
+                }
+            }
+
+            $entry = $tokens[$tokenHash]['days'][$today] ?? ['files' => 0, 'bytes' => 0];
+            $files = is_numeric($entry['files'] ?? null) ? (int)$entry['files'] : 0;
+            $bytes = is_numeric($entry['bytes'] ?? null) ? (int)$entry['bytes'] : 0;
+
+            if ($dailyFileLimit > 0 && ($files + 1) > $dailyFileLimit) {
+                $error = 'Daily upload file limit reached for this share.';
+            } elseif ($maxTotalBytes > 0 && ($bytes + max(0, $sizeBytes)) > $maxTotalBytes) {
+                $error = 'Daily upload size limit reached for this share.';
+            }
+
+            $state['tokens'] = $tokens;
+            return $state;
+        });
+
+        return $error;
+    }
+
+    private static function incrementSharedDailyQuota(string $tokenHash, int $sizeBytes): void
+    {
+        $path = rtrim(self::getShareStateDir(), '/\\') . DIRECTORY_SEPARATOR . 'daily_quota.json';
+        $today = gmdate('Y-m-d');
+        self::withLockedJsonState($path, function (array $state) use ($today, $tokenHash, $sizeBytes) {
+            $tokens = isset($state['tokens']) && is_array($state['tokens']) ? $state['tokens'] : [];
+            $bucket = isset($tokens[$tokenHash]['days'][$today]) && is_array($tokens[$tokenHash]['days'][$today])
+                ? $tokens[$tokenHash]['days'][$today]
+                : ['files' => 0, 'bytes' => 0];
+            $bucket['files'] = (int)($bucket['files'] ?? 0) + 1;
+            $bucket['bytes'] = (int)($bucket['bytes'] ?? 0) + max(0, $sizeBytes);
+
+            if (!isset($tokens[$tokenHash]) || !is_array($tokens[$tokenHash])) {
+                $tokens[$tokenHash] = ['days' => []];
+            }
+            if (!isset($tokens[$tokenHash]['days']) || !is_array($tokens[$tokenHash]['days'])) {
+                $tokens[$tokenHash]['days'] = [];
+            }
+            $tokens[$tokenHash]['days'][$today] = $bucket;
+            $state['tokens'] = $tokens;
+            return $state;
+        });
+    }
+
+    private static function normalizeHeaderServerKey(string $header): string
+    {
+        $key = strtoupper(str_replace('-', '_', trim($header)));
+        if ($key === 'REMOTE_ADDR') {
+            return $key;
+        }
+        if (strpos($key, 'HTTP_') !== 0) {
+            $key = 'HTTP_' . $key;
+        }
+        return $key;
+    }
+
+    private static function trustedProxies(): array
+    {
+        $raw = defined('FR_TRUSTED_PROXIES') ? (string)FR_TRUSTED_PROXIES : '';
+        if ($raw === '') {
+            return [];
+        }
+        $parts = array_map('trim', explode(',', $raw));
+        return array_values(array_filter($parts, static fn($part) => $part !== ''));
+    }
+
+    private static function ipInCidr(string $ip, string $cidr): bool
+    {
+        $cidr = trim($cidr);
+        if ($cidr === '' || strpos($cidr, '/') === false) {
+            return false;
+        }
+        [$subnet, $maskRaw] = explode('/', $cidr, 2);
+        $subnet = trim($subnet);
+        $mask = (int)trim($maskRaw);
+
+        if (!filter_var($ip, FILTER_VALIDATE_IP) || !filter_var($subnet, FILTER_VALIDATE_IP)) {
+            return false;
+        }
+
+        if (strpos($ip, ':') !== false || strpos($subnet, ':') !== false) {
+            if ($mask < 0 || $mask > 128) {
+                return false;
+            }
+            $ipBin = inet_pton($ip);
+            $netBin = inet_pton($subnet);
+            if ($ipBin === false || $netBin === false) {
+                return false;
+            }
+            $bytes = intdiv($mask, 8);
+            $bits = $mask % 8;
+            if ($bytes > 0 && substr($ipBin, 0, $bytes) !== substr($netBin, 0, $bytes)) {
+                return false;
+            }
+            if ($bits > 0) {
+                $maskByte = (~((1 << (8 - $bits)) - 1)) & 0xFF;
+                if ((ord($ipBin[$bytes]) & $maskByte) !== (ord($netBin[$bytes]) & $maskByte)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        if ($mask < 0 || $mask > 32) {
+            return false;
+        }
+        $ipLong = ip2long($ip);
+        $netLong = ip2long($subnet);
+        if ($ipLong === false || $netLong === false) {
+            return false;
+        }
+        $maskLong = $mask === 0 ? 0 : (-1 << (32 - $mask));
+        return (($ipLong & $maskLong) === ($netLong & $maskLong));
+    }
+
+    private static function isTrustedProxy(string $ip, array $trusted): bool
+    {
+        foreach ($trusted as $entry) {
+            $entry = trim((string)$entry);
+            if ($entry === '') {
+                continue;
+            }
+            if (strpos($entry, '/') === false) {
+                if ($ip === $entry) {
+                    return true;
+                }
+                continue;
+            }
+            if (self::ipInCidr($ip, $entry)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static function detectSharedClientIp(): string
+    {
+        $remote = trim((string)($_SERVER['REMOTE_ADDR'] ?? ''));
+        if ($remote === '') {
+            $remote = '0.0.0.0';
+        }
+
+        $trusted = self::trustedProxies();
+        if (empty($trusted) || !self::isTrustedProxy($remote, $trusted)) {
+            return $remote;
+        }
+
+        $headerName = defined('FR_IP_HEADER') ? (string)FR_IP_HEADER : 'X-Forwarded-For';
+        $serverKey = self::normalizeHeaderServerKey($headerName);
+        $raw = (string)($_SERVER[$serverKey] ?? '');
+        if ($raw !== '') {
+            $parts = explode(',', $raw);
+            foreach ($parts as $part) {
+                $candidate = trim($part);
+                if ($candidate !== '' && filter_var($candidate, FILTER_VALIDATE_IP)) {
+                    return $candidate;
+                }
+            }
+        }
+
+        if (!empty($_SERVER['HTTP_X_REAL_IP'])) {
+            $candidate = trim((string)$_SERVER['HTTP_X_REAL_IP']);
+            if ($candidate !== '' && filter_var($candidate, FILTER_VALIDATE_IP)) {
+                return $candidate;
+            }
+        }
+
+        return $remote;
+    }
+
+    private static function rotateJsonLog(string $path, int $maxBytes, int $maxFiles): void
+    {
+        if ($maxBytes <= 0 || $maxFiles <= 1 || !is_file($path)) {
+            return;
+        }
+        $size = @filesize($path);
+        if ($size === false || $size < $maxBytes) {
+            return;
+        }
+
+        $maxRotated = $maxFiles - 1;
+        for ($i = $maxRotated; $i >= 1; $i--) {
+            $src = $path . '.' . $i;
+            if ($i === $maxRotated) {
+                if (is_file($src)) {
+                    @unlink($src);
+                }
+                continue;
+            }
+            $dst = $path . '.' . ($i + 1);
+            if (is_file($src)) {
+                @rename($src, $dst);
+            }
+        }
+        @rename($path, $path . '.1');
+    }
+
+    private static function logSharedUploadSubmission(string $tokenHash, string $ip, string $path, int $bytes): void
+    {
+        $metaRoot = class_exists('SourceContext')
+            ? SourceContext::metaRoot()
+            : rtrim((string)META_DIR, '/\\') . DIRECTORY_SEPARATOR;
+        $logPath = rtrim($metaRoot, '/\\') . DIRECTORY_SEPARATOR . 'share_upload_submissions.log';
+        self::rotateJsonLog($logPath, self::SHARE_UPLOAD_LOG_MAX_BYTES, self::SHARE_UPLOAD_LOG_MAX_FILES);
+
+        $entry = [
+            'createdAt' => gmdate('c'),
+            'tokenHash' => $tokenHash,
+            'ip' => $ip,
+            'path' => $path,
+            'bytes' => max(0, $bytes),
+            'userAgent' => (string)($_SERVER['HTTP_USER_AGENT'] ?? ''),
+        ];
+
+        @file_put_contents(
+            $logPath,
+            json_encode($entry, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . PHP_EOL,
+            FILE_APPEND | LOCK_EX
+        );
+    }
+
+    private static function parseUploadRelativePath(string $raw): array
+    {
+        $raw = rawurldecode((string)$raw);
+        $raw = str_replace('\\', '/', trim($raw));
+        $raw = preg_replace('/[\x00-\x1F\x7F]/', '', $raw);
+        $raw = ltrim($raw, '/');
+        if ($raw === '' || $raw === '.') {
+            return ['', '', null];
+        }
+        if (preg_match('~(^|/)\.\.(?:/|$)~', $raw) || preg_match('~(^|/)\.(?:/|$)~', $raw)) {
+            return ['', '', 'Invalid relative path.'];
+        }
+
+        $file = basename($raw);
+        if ($file === '' || !preg_match(REGEX_FILE_NAME, $file)) {
+            return ['', '', 'Invalid file name.'];
+        }
+
+        $dir = dirname($raw);
+        if ($dir === '.' || $dir === '') {
+            return ['', $file, null];
+        }
+        if (!preg_match(REGEX_FOLDER_NAME, $dir)) {
+            return ['', '', 'Invalid folder name.'];
+        }
+        return [$dir, $file, null];
+    }
+
+    private static function wantsJsonUploadResponse(bool $isChunk): bool
+    {
+        if ($isChunk) {
+            return true;
+        }
+        if (isset($_POST['response']) && strtolower(trim((string)$_POST['response'])) === 'json') {
+            return true;
+        }
+        $accept = strtolower((string)($_SERVER['HTTP_ACCEPT'] ?? ''));
+        if ($accept !== '' && strpos($accept, 'application/json') !== false) {
+            return true;
+        }
+        $xrw = strtolower((string)($_SERVER['HTTP_X_REQUESTED_WITH'] ?? ''));
+        return $xrw === 'xmlhttprequest';
     }
 
     private function isAsyncRequested(array $payload): bool
@@ -1137,12 +1692,9 @@ class FolderController
     /* -------------------- API: Download Shared File -------------------- */
     public function downloadSharedFile(): void
     {
-        $token = filter_input(INPUT_GET, 'token', FILTER_SANITIZE_STRING);
-        $file  = filter_input(INPUT_GET, 'file', FILTER_SANITIZE_STRING);
-        $providedPass = filter_input(INPUT_GET, 'pass', FILTER_SANITIZE_STRING);
-        if ($providedPass === null || $providedPass === false) {
-            $providedPass = '';
-        }
+        $token = self::getQueryString('token');
+        $file  = self::getQueryString('file');
+        $providedPass = self::getQueryString('pass');
         $path  = (string)($_GET['path'] ?? '');
         $inlineRequested = ((string)($_GET['inline'] ?? '') === '1');
 
@@ -1173,7 +1725,12 @@ class FolderController
             exit;
         }
         if (isset($result['error'])) {
-            $code = ($result['error'] === 'Invalid password.') ? 403 : 404;
+            $forbiddenErrors = [
+                'Invalid password.',
+                'Password required.',
+                'Downloads are disabled for this upload-only share.',
+            ];
+            $code = in_array((string)$result['error'], $forbiddenErrors, true) ? 403 : 404;
             http_response_code($code);
             header('Content-Type: application/json; charset=utf-8');
             echo json_encode(["error" => $result['error']]);
@@ -1334,8 +1891,8 @@ class FolderController
     /* -------------------- API: Download Shared Folder (ZIP) -------------------- */
     public function downloadSharedFolder(): void
     {
-        $token = filter_input(INPUT_GET, 'token', FILTER_SANITIZE_STRING);
-        $providedPass = filter_input(INPUT_GET, 'pass', FILTER_SANITIZE_STRING);
+        $token = self::getQueryString('token');
+        $providedPass = self::getQueryString('pass');
         $path  = (string)($_GET['path'] ?? '');
 
         $accept = (string)($_SERVER['HTTP_ACCEPT'] ?? '');
@@ -1412,6 +1969,9 @@ class FolderController
         }
         if (isset($ctx['error'])) {
             $renderError(404, (string)$ctx['error']);
+        }
+        if (!empty($ctx['hideListing']) || (isset($ctx['mode']) && (string)$ctx['mode'] === 'drop')) {
+            $renderError(403, "Downloads are disabled for this upload-only share.");
         }
 
         $storage = StorageRegistry::getAdapter();
@@ -1602,11 +2162,11 @@ class FolderController
     /* -------------------- Public Shared Folder HTML -------------------- */
     public function shareFolder(): void
     {
-        $token        = filter_input(INPUT_GET, 'token', FILTER_SANITIZE_STRING);
-        $providedPass = filter_input(INPUT_GET, 'pass', FILTER_SANITIZE_STRING);
-        $page         = filter_input(INPUT_GET, 'page', FILTER_VALIDATE_INT);
+        $token        = self::getQueryString('token');
+        $providedPass = self::getQueryString('pass');
+        $page         = self::getQueryInt('page');
         $path         = (string)($_GET['path'] ?? '');
-        if ($page === false || $page < 1) {
+        if ($page === null || $page < 1) {
             $page = 1;
         }
 
@@ -1670,42 +2230,69 @@ class FolderController
             echo json_encode(["error" => $data['error']]);
             exit;
         }
-        $adminConfig          = AdminModel::getConfig();
-        $sharedMaxUploadSize  = (isset($adminConfig['sharedMaxUploadSize']) && is_numeric($adminConfig['sharedMaxUploadSize']))
-            ? (int)$adminConfig['sharedMaxUploadSize'] : null;
+        $adminConfig = AdminModel::getConfig();
+        $sharedMaxUploadSize = (isset($adminConfig['sharedMaxUploadSize']) && is_numeric($adminConfig['sharedMaxUploadSize']))
+            ? (int)$adminConfig['sharedMaxUploadSize']
+            : null;
         $headerTitle = trim((string)($adminConfig['header_title'] ?? 'FileRise'));
         if ($headerTitle === '') {
             $headerTitle = 'FileRise';
         }
 
-        $entries     = is_array($data['entries'] ?? null) ? $data['entries'] : [];
+        $record = is_array($data['record'] ?? null) ? $data['record'] : [];
+        $entries = is_array($data['entries'] ?? null) ? $data['entries'] : [];
         $currentPage = (int)($data['currentPage'] ?? 1);
-        $totalPages  = (int)($data['totalPages'] ?? 1);
+        $totalPages = (int)($data['totalPages'] ?? 1);
         $totalEntries = (int)($data['totalEntries'] ?? 0);
-        $shareRoot   = (string)($data['shareRoot'] ?? 'root');
+        $shareRoot = (string)($data['shareRoot'] ?? 'root');
         $currentPath = (string)($data['path'] ?? '');
         $allowSubfolders = !empty($data['allowSubfolders']);
-        $displayName = 'Shared Folder';
-        if ($currentPath !== '') {
-            $displayName = basename($currentPath);
-        } elseif ($shareRoot !== '' && strtolower($shareRoot) !== 'root') {
-            $displayName = basename($shareRoot);
+        $allowUpload = isset($record['allowUpload']) && (int)$record['allowUpload'] === 1;
+        $isDropMode = (isset($record['mode']) && (string)$record['mode'] === 'drop')
+            || !empty($record['hideListing'])
+            || !empty($data['hideListing']);
+        if ($isDropMode) {
+            $allowUpload = true;
+            $entries = [];
+            $currentPage = 1;
+            $totalPages = 1;
+            $totalEntries = 0;
         }
-        $pageTitle = $headerTitle . ' Share';
+        $hideListing = $isDropMode || !empty($data['hideListing']);
+        $preserveFolderStructure = !isset($record['preserveFolderStructure']) || !empty($record['preserveFolderStructure']);
+
+        $displayName = $isDropMode ? 'Upload files' : 'Shared Folder';
+        if (!$isDropMode) {
+            if ($currentPath !== '') {
+                $displayName = basename($currentPath);
+            } elseif ($shareRoot !== '' && strtolower($shareRoot) !== 'root') {
+                $displayName = basename($shareRoot);
+            }
+        }
+        $pageTitle = $headerTitle . ($isDropMode ? ' File Request' : ' Share');
         if ($displayName !== '') {
             $pageTitle .= ': ' . $displayName;
         }
+
         $storage = StorageRegistry::getAdapter();
-        $canDownloadAll = $storage->isLocal();
-        $allowUpload = isset($data['record']['allowUpload']) && (int)$data['record']['allowUpload'] === 1;
+        $canDownloadAll = !$hideListing && $storage->isLocal();
+
+        $effectiveMaxFileSizeMb = (isset($record['maxFileSizeMb']) && is_numeric($record['maxFileSizeMb']) && (int)$record['maxFileSizeMb'] > 0)
+            ? (int)$record['maxFileSizeMb']
+            : (($sharedMaxUploadSize !== null && $sharedMaxUploadSize > 0) ? (int)ceil($sharedMaxUploadSize / (1024 * 1024)) : 0);
+        $allowedTypes = self::normalizeSharedAllowedTypes($record['allowedTypes'] ?? []);
+        $dailyFileLimit = (isset($record['dailyFileLimit']) && is_numeric($record['dailyFileLimit'])) ? (int)$record['dailyFileLimit'] : 0;
+        $maxTotalMbPerDay = (isset($record['maxTotalMbPerDay']) && is_numeric($record['maxTotalMbPerDay'])) ? (int)$record['maxTotalMbPerDay'] : 0;
+
         $uploadToken = '';
         if ($allowUpload) {
             $secret = (string)($GLOBALS['encryptionKey'] ?? '');
             if ($secret !== '') {
-                $seed = $token . '|' . $currentPath . '|' . $providedPass;
+                $seed = $token . '|' . (string)$providedPass;
                 $uploadToken = hash_hmac('sha256', $seed, $secret);
             }
         }
+
         $shareBaseUrl = fr_with_base_path('/api/folder/shareFolder.php');
         $queryBase = 'token=' . urlencode($token);
         if (!empty($providedPass)) {
@@ -1737,42 +2324,47 @@ class FolderController
                     <div class="fr-share-card-header">
                         <img id="shareLogo" class="fr-share-logo" src="<?php echo htmlspecialchars(fr_with_base_path('/assets/logo.svg?v={{APP_QVER}}'), ENT_QUOTES, 'UTF-8'); ?>" alt="FileRise">
                         <div class="fr-share-header-text">
-                            <div class="fr-share-kicker">Shared folder</div>
+                            <div class="fr-share-kicker"><?php echo $isDropMode ? 'File request' : 'Shared folder'; ?></div>
                             <div id="shareTitle" class="fr-share-title"><?php echo htmlspecialchars($displayName, ENT_QUOTES, 'UTF-8'); ?></div>
                             <div id="shareBreadcrumbs" class="fr-share-breadcrumbs"></div>
                         </div>
                         <div class="fr-share-actions">
-                            <button type="button" id="downloadAllBtn" class="fr-share-btn" <?php echo $canDownloadAll ? '' : 'disabled'; ?>>Download all</button>
-                            <button type="button" id="toggleViewBtn" class="fr-share-btn fr-share-btn-ghost">Gallery</button>
+                            <?php if (!$hideListing) : ?>
+                                <button type="button" id="downloadAllBtn" class="fr-share-btn" <?php echo $canDownloadAll ? '' : 'disabled'; ?>>Download all</button>
+                                <button type="button" id="toggleViewBtn" class="fr-share-btn fr-share-btn-ghost">Gallery</button>
+                            <?php endif; ?>
                             <button type="button" id="shareThemeToggle" class="fr-share-btn fr-share-btn-ghost">Dark mode</button>
                         </div>
                     </div>
 
-                    <div class="fr-share-toolbar">
-                        <div class="fr-share-search-wrap">
-                            <input type="text" id="shareSearchInput" class="fr-share-search" placeholder="Search this folder">
+                    <?php if (!$hideListing) : ?>
+                        <div class="fr-share-toolbar">
+                            <div class="fr-share-search-wrap">
+                                <input type="text" id="shareSearchInput" class="fr-share-search" placeholder="Search this folder">
+                            </div>
+                            <div id="shareCount" class="fr-share-count"></div>
                         </div>
-                        <div id="shareCount" class="fr-share-count"></div>
-                    </div>
+                    <?php endif; ?>
 
-                    <?php if ($allowUpload) : ?>
+                    <?php if ($allowUpload && !$isDropMode) : ?>
                         <div class="fr-share-card fr-share-upload">
                             <div class="fr-share-upload-title">
-                                Upload file<?php if ($sharedMaxUploadSize !== null) :
-                                    ?> (<?php echo self::formatBytes($sharedMaxUploadSize); ?> max)<?php
-                                           endif; ?>
+                                Upload file
+                                <?php if ($sharedMaxUploadSize !== null) : ?>
+                                    (<?php echo self::formatBytes($sharedMaxUploadSize); ?> max)
+                                <?php endif; ?>
                             </div>
                             <form action="<?php echo htmlspecialchars(fr_with_base_path('/api/folder/uploadToSharedFolder.php'), ENT_QUOTES, 'UTF-8'); ?>" method="post" enctype="multipart/form-data" class="fr-share-upload-form">
                                 <input type="hidden" name="token" value="<?php echo htmlspecialchars($token, ENT_QUOTES, 'UTF-8'); ?>">
-                                <?php if (!empty($providedPass)) :
-                                    ?><input type="hidden" name="pass" value="<?php echo htmlspecialchars($providedPass, ENT_QUOTES, 'UTF-8'); ?>"><?php
-                                endif; ?>
-                                <?php if ($currentPath !== '') :
-                                    ?><input type="hidden" name="path" value="<?php echo htmlspecialchars($currentPath, ENT_QUOTES, 'UTF-8'); ?>"><?php
-                                endif; ?>
-                                <?php if ($uploadToken !== '') :
-                                    ?><input type="hidden" name="share_upload_token" value="<?php echo htmlspecialchars($uploadToken, ENT_QUOTES, 'UTF-8'); ?>"><?php
-                                endif; ?>
+                                <?php if (!empty($providedPass)) : ?>
+                                    <input type="hidden" name="pass" value="<?php echo htmlspecialchars($providedPass, ENT_QUOTES, 'UTF-8'); ?>">
+                                <?php endif; ?>
+                                <?php if ($currentPath !== '') : ?>
+                                    <input type="hidden" name="path" value="<?php echo htmlspecialchars($currentPath, ENT_QUOTES, 'UTF-8'); ?>">
+                                <?php endif; ?>
+                                <?php if ($uploadToken !== '') : ?>
+                                    <input type="hidden" name="share_upload_token" value="<?php echo htmlspecialchars($uploadToken, ENT_QUOTES, 'UTF-8'); ?>">
+                                <?php endif; ?>
                                 <input type="file" name="fileToUpload" required>
                                 <button type="submit" class="fr-share-btn">Upload</button>
                             </form>
@@ -1783,34 +2375,72 @@ class FolderController
                                 <div id="shareUploadProgressText" class="fr-share-upload-progress-text">Uploading...</div>
                             </div>
                         </div>
+                    <?php elseif ($allowUpload && $isDropMode) : ?>
+                        <div class="fr-share-card fr-share-upload fr-share-upload-drop">
+                            <div class="fr-share-upload-title">Upload files</div>
+                            <div class="fr-share-upload-subtitle">
+                                Uploaders can't see existing files<?php echo $allowSubfolders ? '.' : ', and folder uploads are disabled for this link.'; ?>
+                            </div>
+                            <form id="shareDropUploadForm" action="<?php echo htmlspecialchars(fr_with_base_path('/api/folder/uploadToSharedFolder.php'), ENT_QUOTES, 'UTF-8'); ?>" method="post" enctype="multipart/form-data" class="fr-share-upload-form fr-share-upload-form-drop">
+                                <input type="hidden" name="token" value="<?php echo htmlspecialchars($token, ENT_QUOTES, 'UTF-8'); ?>">
+                                <?php if (!empty($providedPass)) : ?>
+                                    <input type="hidden" name="pass" value="<?php echo htmlspecialchars($providedPass, ENT_QUOTES, 'UTF-8'); ?>">
+                                <?php endif; ?>
+                                <?php if ($currentPath !== '') : ?>
+                                    <input type="hidden" name="path" value="<?php echo htmlspecialchars($currentPath, ENT_QUOTES, 'UTF-8'); ?>">
+                                <?php endif; ?>
+                                <?php if ($uploadToken !== '') : ?>
+                                    <input type="hidden" name="share_upload_token" value="<?php echo htmlspecialchars($uploadToken, ENT_QUOTES, 'UTF-8'); ?>">
+                                <?php endif; ?>
+                                <input type="hidden" name="response" value="json">
+                                <input type="file" id="shareDropFileInput" name="fileToUpload" multiple hidden>
+                                <input type="file" id="shareDropFolderInput" name="fileToUpload" multiple webkitdirectory directory hidden>
+                                <div id="shareDropzone" class="fr-share-dropzone" tabindex="0" role="button" aria-label="Upload files">
+                                    <div class="fr-share-dropzone-title">Drag and drop files<?php echo $allowSubfolders ? ' or folders' : ''; ?></div>
+                                    <div class="fr-share-dropzone-subtitle">Or choose files from your device.</div>
+                                    <div class="fr-share-dropzone-actions">
+                                        <button type="button" id="shareChooseFilesBtn" class="fr-share-btn">Choose files</button>
+                                        <?php if ($allowSubfolders) : ?>
+                                            <button type="button" id="shareChooseFolderBtn" class="fr-share-btn fr-share-btn-ghost">Choose folder</button>
+                                        <?php endif; ?>
+                                    </div>
+                                </div>
+                            </form>
+                            <div id="shareDropRules" class="fr-share-drop-rules"></div>
+                            <div id="shareDropQueue" class="fr-share-drop-queue"></div>
+                        </div>
                     <?php endif; ?>
 
-                    <div id="shareListView" class="fr-share-list"></div>
-                    <div id="shareGalleryView" class="fr-share-gallery" style="display:none;"></div>
-                    <div id="shareEmptyState" class="fr-share-empty" style="display:none;">This folder is empty.</div>
+                    <?php if (!$hideListing) : ?>
+                        <div id="shareListView" class="fr-share-list"></div>
+                        <div id="shareGalleryView" class="fr-share-gallery" style="display:none;"></div>
+                        <div id="shareEmptyState" class="fr-share-empty" style="display:none;">This folder is empty.</div>
 
-                    <?php if ($totalPages > 1) : ?>
-                        <div class="fr-share-pagination">
-                            <?php if ($currentPage > 1) : ?>
-                                <a href="<?php echo htmlspecialchars($shareBaseUrl . '?' . $queryBase . '&page=' . ($currentPage - 1), ENT_QUOTES, 'UTF-8'); ?>">Prev</a>
-                            <?php else :
-                                ?><span>Prev</span><?php
-                            endif; ?>
-                            <?php $startPage = max(1, $currentPage - 2);
-                            $endPage = min($totalPages, $currentPage + 2);
-                            for ($i = $startPage; $i <= $endPage; $i++) : ?>
-                                <?php if ($i == $currentPage) :
-                                    ?><span class="current"><?php echo $i; ?></span>
-                                <?php else :
-                                    ?><a href="<?php echo htmlspecialchars($shareBaseUrl . '?' . $queryBase . '&page=' . $i, ENT_QUOTES, 'UTF-8'); ?>"><?php echo $i; ?></a>
-                                <?php endif;
-                            endfor; ?>
-                            <?php if ($currentPage < $totalPages) : ?>
-                                <a href="<?php echo htmlspecialchars($shareBaseUrl . '?' . $queryBase . '&page=' . ($currentPage + 1), ENT_QUOTES, 'UTF-8'); ?>">Next</a>
-                            <?php else :
-                                ?><span>Next</span><?php
-                            endif; ?>
-                        </div>
+                        <?php if ($totalPages > 1) : ?>
+                            <div class="fr-share-pagination">
+                                <?php if ($currentPage > 1) : ?>
+                                    <a href="<?php echo htmlspecialchars($shareBaseUrl . '?' . $queryBase . '&page=' . ($currentPage - 1), ENT_QUOTES, 'UTF-8'); ?>">Prev</a>
+                                <?php else : ?>
+                                    <span>Prev</span>
+                                <?php endif; ?>
+                                <?php
+                                $startPage = max(1, $currentPage - 2);
+                                $endPage = min($totalPages, $currentPage + 2);
+                                for ($i = $startPage; $i <= $endPage; $i++) :
+                                    if ($i == $currentPage) :
+                                        ?><span class="current"><?php echo $i; ?></span><?php
+                                    else :
+                                        ?><a href="<?php echo htmlspecialchars($shareBaseUrl . '?' . $queryBase . '&page=' . $i, ENT_QUOTES, 'UTF-8'); ?>"><?php echo $i; ?></a><?php
+                                    endif;
+                                endfor;
+                                ?>
+                                <?php if ($currentPage < $totalPages) : ?>
+                                    <a href="<?php echo htmlspecialchars($shareBaseUrl . '?' . $queryBase . '&page=' . ($currentPage + 1), ENT_QUOTES, 'UTF-8'); ?>">Next</a>
+                                <?php else : ?>
+                                    <span>Next</span>
+                                <?php endif; ?>
+                            </div>
+                        <?php endif; ?>
                     <?php endif; ?>
                 </div>
 
@@ -1826,9 +2456,21 @@ class FolderController
                 'totalEntries' => $totalEntries,
                 'currentPage' => $currentPage,
                 'totalPages' => $totalPages,
+                'mode' => $isDropMode ? 'drop' : 'browse',
+                'hideListing' => $hideListing ? 1 : 0,
+                'allowUpload' => $allowUpload ? 1 : 0,
+                'preserveFolderStructure' => $preserveFolderStructure ? 1 : 0,
+                'maxFileSizeMb' => $effectiveMaxFileSizeMb,
+                'allowedTypes' => $allowedTypes,
+                'dailyFileLimit' => max(0, $dailyFileLimit),
+                'maxTotalMbPerDay' => max(0, $maxTotalMbPerDay),
             ], JSON_HEX_TAG | JSON_HEX_AMP); ?></script>
             <script src="<?php echo htmlspecialchars(fr_with_base_path('/js/shareBranding.js?v={{APP_QVER}}'), ENT_QUOTES, 'UTF-8'); ?>" defer></script>
-            <script src="<?php echo htmlspecialchars(fr_with_base_path('/js/sharedFolderView.js?v={{APP_QVER}}'), ENT_QUOTES, 'UTF-8'); ?>" defer></script>
+            <?php if ($isDropMode) : ?>
+                <script type="module" src="<?php echo htmlspecialchars(fr_with_base_path('/js/sharedDropView.js?v={{APP_QVER}}'), ENT_QUOTES, 'UTF-8'); ?>"></script>
+            <?php else : ?>
+                <script type="module" src="<?php echo htmlspecialchars(fr_with_base_path('/js/sharedFolderView.js?v={{APP_QVER}}'), ENT_QUOTES, 'UTF-8'); ?>"></script>
+            <?php endif; ?>
         </body>
 
         </html>
@@ -1857,6 +2499,30 @@ class FolderController
         $password    = (string)($in['password'] ?? '');
         $allowUpload = intval($in['allowUpload'] ?? 0);
         $allowSubfolders = intval($in['allowSubfolders'] ?? 0);
+        $mode = strtolower(trim((string)($in['mode'] ?? 'browse')));
+        $fileDrop = $this->truthy($in['fileDrop'] ?? false) || $this->truthy($in['fileDropMode'] ?? false);
+        if ($fileDrop || $mode === 'drop') {
+            $mode = 'drop';
+            $allowUpload = 1;
+        } else {
+            $mode = 'browse';
+        }
+        $hideListing = array_key_exists('hideListing', $in)
+            ? ($this->truthy($in['hideListing']) ? 1 : 0)
+            : ($mode === 'drop' ? 1 : 0);
+        $preserveFolderStructure = array_key_exists('preserveFolderStructure', $in)
+            ? ($this->truthy($in['preserveFolderStructure']) ? 1 : 0)
+            : 1;
+        $maxFileSizeMb = isset($in['maxFileSizeMb']) && is_numeric($in['maxFileSizeMb'])
+            ? max(0, min(102400, (int)$in['maxFileSizeMb']))
+            : 0;
+        $dailyFileLimit = isset($in['dailyFileLimit']) && is_numeric($in['dailyFileLimit'])
+            ? max(0, min(2000000, (int)$in['dailyFileLimit']))
+            : 0;
+        $maxTotalMbPerDay = isset($in['maxTotalMbPerDay']) && is_numeric($in['maxTotalMbPerDay'])
+            ? max(0, min(2000000, (int)$in['maxTotalMbPerDay']))
+            : 0;
+        $allowedTypes = self::normalizeSharedAllowedTypes($in['allowedTypes'] ?? []);
 
         if ($folder !== 'root' && !preg_match(REGEX_FOLDER_NAME, $folder)) {
             http_response_code(400);
@@ -1925,7 +2591,25 @@ class FolderController
         }
         $seconds = min($seconds, 31536000);
 
-        $res = FolderModel::createShareFolderLink($folder, $seconds, $password, $allowUpload, $allowSubfolders);
+        $res = FolderModel::createShareFolderLink(
+            $folder,
+            $seconds,
+            $password,
+            $allowUpload,
+            $allowSubfolders,
+            [
+                'mode' => $mode,
+                'fileDrop' => $fileDrop ? 1 : 0,
+                'hideListing' => $hideListing,
+                'preserveFolderStructure' => $preserveFolderStructure,
+                'maxFileSizeMb' => $maxFileSizeMb,
+                'allowedTypes' => $allowedTypes,
+                'dailyFileLimit' => $dailyFileLimit,
+                'maxTotalMbPerDay' => $maxTotalMbPerDay,
+                'createdBy' => $username,
+                'createdAt' => time(),
+            ]
+        );
         if (is_array($res) && !empty($res['token'])) {
             AuditHook::log('share.link.create', [
                 'user'   => $username,
@@ -1950,177 +2634,230 @@ class FolderController
             exit;
         }
 
-        if (empty($_POST['token'])) {
+        $token = trim((string)($_POST['token'] ?? ''));
+        if ($token === '') {
             http_response_code(400);
             header('Content-Type: application/json; charset=utf-8');
             echo json_encode(["error" => "Missing share token."]);
             exit;
         }
-        $token = trim((string)$_POST['token']);
+
         $subPath = (string)($_POST['path'] ?? '');
         $providedPass = (string)($_POST['pass'] ?? '');
         $uploadToken = (string)($_POST['share_upload_token'] ?? '');
+        $isChunkUpload = isset($_POST['resumableChunkNumber']) || isset($_POST['resumableIdentifier']);
+        $wantsJson = self::wantsJsonUploadResponse($isChunkUpload);
+
+        $respondError = static function (int $status, string $message) {
+            http_response_code($status);
+            header('Content-Type: application/json; charset=utf-8');
+            echo json_encode(['error' => $message]);
+            exit;
+        };
 
         $secret = (string)($GLOBALS['encryptionKey'] ?? '');
         if ($secret !== '') {
-            $seed = $token . '|' . $subPath . '|' . $providedPass;
-            $expected = hash_hmac('sha256', $seed, $secret);
-            if ($uploadToken === '' || !hash_equals($expected, $uploadToken)) {
-                http_response_code(403);
-                header('Content-Type: application/json; charset=utf-8');
-                echo json_encode(["error" => "Upload token missing or invalid."]);
-                exit;
+            $expectedScoped = hash_hmac('sha256', $token . '|' . $subPath . '|' . $providedPass, $secret);
+            $expectedGlobal = hash_hmac('sha256', $token . '|' . $providedPass, $secret);
+            $okToken = ($uploadToken !== '')
+                && (hash_equals($expectedScoped, $uploadToken) || hash_equals($expectedGlobal, $uploadToken));
+            if (!$okToken) {
+                $respondError(403, "Upload token missing or invalid.");
             }
         }
 
-        if (!isset($_FILES['fileToUpload'])) {
-            http_response_code(400);
-            header('Content-Type: application/json; charset=utf-8');
-            echo json_encode(["error" => "No file was uploaded."]);
-            exit;
+        $ctx = FolderModel::getSharedUploadContext($token, $providedPass, $subPath);
+        if (isset($ctx['needs_password'])) {
+            $respondError(403, "Password required.");
         }
-        $fileUpload = $_FILES['fileToUpload'];
-
-        if (!empty($fileUpload['error']) && $fileUpload['error'] !== UPLOAD_ERR_OK) {
-            $map = [
-                UPLOAD_ERR_INI_SIZE   => 'The uploaded file exceeds the upload_max_filesize directive.',
-                UPLOAD_ERR_FORM_SIZE  => 'The uploaded file exceeds the MAX_FILE_SIZE directive.',
-                UPLOAD_ERR_PARTIAL    => 'The uploaded file was only partially uploaded.',
-                UPLOAD_ERR_NO_FILE    => 'No file was uploaded.',
-                UPLOAD_ERR_NO_TMP_DIR => 'Missing a temporary folder.',
-                UPLOAD_ERR_CANT_WRITE => 'Failed to write file to disk.',
-                UPLOAD_ERR_EXTENSION  => 'A PHP extension stopped the file upload.'
-            ];
-            $msg = $map[$fileUpload['error']] ?? 'Upload error.';
-            http_response_code(400);
-            header('Content-Type: application/json; charset=utf-8');
-            echo json_encode(['error' => $msg]);
-            exit;
+        if (isset($ctx['error'])) {
+            $respondError(403, (string)$ctx['error']);
         }
 
-        // Basic sanity: must be an uploaded tmp file
-        $tmp = (string)($fileUpload['tmp_name'] ?? '');
-        if ($tmp === '' || !is_uploaded_file($tmp)) {
-            http_response_code(400);
-            header('Content-Type: application/json; charset=utf-8');
-            echo json_encode(['error' => 'Invalid upload.']);
-            exit;
+        $record = is_array($ctx['record'] ?? null) ? $ctx['record'] : [];
+        $targetFolder = (string)($ctx['folder'] ?? 'root');
+        if ($targetFolder === '') {
+            $targetFolder = 'root';
+        }
+        $allowSubfolders = !empty($ctx['allowSubfolders']);
+        $preserveFolderStructure = !isset($record['preserveFolderStructure']) || !empty($record['preserveFolderStructure']);
+
+        $clientIp = self::detectSharedClientIp();
+        $tokenHash = self::shareTokenFingerprint($token);
+        $rateErr = self::applySharedUploadRateLimit($tokenHash, $clientIp);
+        if (is_array($rateErr) && !empty($rateErr['error'])) {
+            header('Retry-After: ' . max(1, (int)($rateErr['retryAfter'] ?? 1)));
+            $respondError(429, (string)$rateErr['error']);
         }
 
-        // Validate & normalize filename
-        $origName = (string)($fileUpload['name'] ?? '');
-        $basename = basename($origName);
+        $filename = '';
+        $sizeBytes = 0;
+        $relativePath = '';
+        $filesForModel = [];
+        $requestParams = ['folder' => $targetFolder, 'source' => 'shared'];
 
-        if (!defined('REGEX_FILE_NAME') || !preg_match(REGEX_FILE_NAME, $basename)) {
-            http_response_code(400);
-            header('Content-Type: application/json; charset=utf-8');
-            echo json_encode(["error" => "Invalid file name."]);
-            exit;
-        }
-
-        // Block SVG/SVGZ uploads to shared folders (prevents stored XSS via public share endpoints)
-        $ext = strtolower(pathinfo($basename, PATHINFO_EXTENSION));
-
-        $detectedMime = '';
-        if (function_exists('finfo_open')) {
-            $fi = @finfo_open(FILEINFO_MIME_TYPE);
-            if ($fi) {
-                $detectedMime = (string)@finfo_file($fi, $tmp);
-                @finfo_close($fi);
+        if ($isChunkUpload) {
+            $chunkNo = isset($_POST['resumableChunkNumber']) ? (int)$_POST['resumableChunkNumber'] : 0;
+            $totalChunks = isset($_POST['resumableTotalChunks']) ? (int)$_POST['resumableTotalChunks'] : 0;
+            if ($chunkNo < 1 || $totalChunks < 1 || $chunkNo > $totalChunks) {
+                $respondError(400, 'Invalid upload chunk parameters.');
             }
-        }
 
-        $looksLikeSvg = false;
-        if ($ext === 'svg' || $ext === 'svgz') {
-            $looksLikeSvg = true;
-        } elseif ($detectedMime === 'image/svg+xml') {
-            $looksLikeSvg = true;
+            $identifier = trim((string)($_POST['resumableIdentifier'] ?? ''));
+            if ($identifier === '' || !preg_match('/^[A-Za-z0-9_-]{1,120}$/', $identifier)) {
+                $respondError(400, 'Invalid upload identifier.');
+            }
+
+            $filename = basename(trim((string)($_POST['resumableFilename'] ?? '')));
+            if ($filename === '' || !preg_match(REGEX_FILE_NAME, $filename)) {
+                $respondError(400, 'Invalid file name.');
+            }
+
+            $sizeBytes = isset($_POST['resumableTotalSize']) && is_numeric($_POST['resumableTotalSize'])
+                ? max(0, (int)$_POST['resumableTotalSize'])
+                : 0;
+
+            $relativePath = (string)($_POST['resumableRelativePath'] ?? '');
+            if (!$preserveFolderStructure) {
+                $relativePath = '';
+            }
+            if ($relativePath !== '') {
+                [$subDir, $relFile, $relErr] = self::parseUploadRelativePath($relativePath);
+                if ($relErr !== null) {
+                    $respondError(400, $relErr);
+                }
+                if ($subDir !== '' && !$allowSubfolders) {
+                    $respondError(403, 'Subfolder uploads are not enabled for this share.');
+                }
+                if ($relFile !== '') {
+                    $filename = $relFile;
+                }
+            }
+
+            if (!isset($_FILES['file'])) {
+                if (isset($_FILES['fileToUpload'])) {
+                    $_FILES['file'] = $_FILES['fileToUpload'];
+                } else {
+                    $respondError(400, 'Missing upload chunk payload.');
+                }
+            }
+            $chunkUpload = $_FILES['file'];
+            if (($chunkUpload['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+                $respondError(400, 'Chunk upload failed.');
+            }
+            $chunkTmp = (string)($chunkUpload['tmp_name'] ?? '');
+            if ($chunkTmp === '' || !is_uploaded_file($chunkTmp)) {
+                $respondError(400, 'Invalid upload chunk.');
+            }
+
+            $requestParams['resumableChunkNumber'] = $chunkNo;
+            $requestParams['resumableTotalChunks'] = $totalChunks;
+            $requestParams['resumableIdentifier'] = $identifier;
+            $requestParams['resumableFilename'] = $filename;
+            $requestParams['resumableTotalSize'] = $sizeBytes;
+            if ($relativePath !== '') {
+                $requestParams['resumableRelativePath'] = $relativePath;
+            }
+            $filesForModel['file'] = $chunkUpload;
         } else {
-            // Lightweight content sniff: check first chunk for "<svg"
-            $chunk = @file_get_contents($tmp, false, null, 0, 4096);
-            if (is_string($chunk) && stripos($chunk, '<svg') !== false) {
-                $looksLikeSvg = true;
+            $fileUpload = $_FILES['fileToUpload'] ?? ($_FILES['file'] ?? null);
+            if (!is_array($fileUpload)) {
+                $respondError(400, 'No file was uploaded.');
             }
+            if (($fileUpload['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+                $map = [
+                    UPLOAD_ERR_INI_SIZE   => 'The uploaded file exceeds the upload_max_filesize directive.',
+                    UPLOAD_ERR_FORM_SIZE  => 'The uploaded file exceeds the MAX_FILE_SIZE directive.',
+                    UPLOAD_ERR_PARTIAL    => 'The uploaded file was only partially uploaded.',
+                    UPLOAD_ERR_NO_FILE    => 'No file was uploaded.',
+                    UPLOAD_ERR_NO_TMP_DIR => 'Missing a temporary folder.',
+                    UPLOAD_ERR_CANT_WRITE => 'Failed to write file to disk.',
+                    UPLOAD_ERR_EXTENSION  => 'A PHP extension stopped the file upload.'
+                ];
+                $msg = $map[$fileUpload['error']] ?? 'Upload error.';
+                $respondError(400, $msg);
+            }
+
+            $tmp = (string)($fileUpload['tmp_name'] ?? '');
+            if ($tmp === '' || !is_uploaded_file($tmp)) {
+                $respondError(400, 'Invalid upload.');
+            }
+
+            $filename = basename((string)($fileUpload['name'] ?? ''));
+            if ($filename === '' || !preg_match(REGEX_FILE_NAME, $filename)) {
+                $respondError(400, 'Invalid file name.');
+            }
+            $sizeBytes = isset($fileUpload['size']) && is_numeric($fileUpload['size'])
+                ? max(0, (int)$fileUpload['size'])
+                : 0;
+
+            $relativePath = (string)($_POST['relativePath'] ?? '');
+            if (!$preserveFolderStructure) {
+                $relativePath = '';
+            }
+            if ($relativePath !== '') {
+                [$subDir, $relFile, $relErr] = self::parseUploadRelativePath($relativePath);
+                if ($relErr !== null) {
+                    $respondError(400, $relErr);
+                }
+                if ($subDir !== '' && !$allowSubfolders) {
+                    $respondError(403, 'Subfolder uploads are not enabled for this share.');
+                }
+                if ($relFile !== '') {
+                    $filename = $relFile;
+                }
+            }
+
+            if ($relativePath !== '') {
+                $requestParams['relativePath'] = $relativePath;
+            }
+            $filesForModel['file'] = $fileUpload;
         }
 
-        if ($looksLikeSvg) {
-            http_response_code(400);
-            header('Content-Type: application/json; charset=utf-8');
-            echo json_encode(["error" => "Upload blocked: SVG files are not allowed in shared folders."]);
-            exit;
+        $ruleError = self::validateSharedUploadRules($record, $filename, $sizeBytes);
+        if ($ruleError !== null) {
+            $respondError(400, $ruleError);
         }
 
-        $tmp = (string)($fileUpload['tmp_name'] ?? '');
-        $mime = function_exists('mime_content_type') ? (string)@mime_content_type($tmp) : '';
-
-        if ($mime === 'image/svg+xml') {
-            http_response_code(400);
-            header('Content-Type: application/json; charset=utf-8');
-            echo json_encode(['error' => 'Upload blocked: SVG files are not allowed in shared folders.']);
-            exit;
+        $quotaError = self::checkSharedDailyQuota($record, $tokenHash, $sizeBytes);
+        if ($quotaError !== null) {
+            header('Retry-After: 3600');
+            $respondError(429, $quotaError);
         }
 
-        // ultra-light sniff as fallback
-        $head = @file_get_contents($tmp, false, null, 0, 4096);
-        if (is_string($head) && stripos($head, '<svg') !== false) {
-            http_response_code(400);
-            header('Content-Type: application/json; charset=utf-8');
-            echo json_encode(['error' => 'Upload blocked: SVG files are not allowed in shared folders.']);
-            exit;
-        }
-
-        // ---- ClamAV: reuse UploadModel scan logic on the tmp file ----
-        $shareRecord = FolderModel::getShareFolderRecord($token);
-        $shareFolderKey = 'root';
-        if (is_array($shareRecord)) {
-            $rawFolder = trim((string)($shareRecord['folder'] ?? ''), "/\\ ");
-            $shareFolderKey = ($rawFolder === '' ? 'root' : $rawFolder);
-        }
-        $scan = UploadModel::scanSingleUploadIfEnabled($fileUpload, [
-            'folder' => $shareFolderKey,
-            'file'   => $basename,
-            'source' => 'shared',
-        ]);
-        if (is_array($scan) && isset($scan['error'])) {
-            // scanSingleUploadIfEnabled() already deletes the tmp file on infection
-            http_response_code(400);
-            header('Content-Type: application/json; charset=utf-8');
-            echo json_encode($scan); // e.g. ["error" => "Upload blocked: virus detected in file."]
-            exit;
-        }
-        // --------------------------------------------------------------
-
-        $result = FolderModel::uploadToSharedFolder($token, $fileUpload, $subPath, $providedPass);
+        $result = UploadModel::handleUpload($requestParams, $filesForModel);
         if (isset($result['error'])) {
-            http_response_code(400);
-            header('Content-Type: application/json; charset=utf-8');
-            echo json_encode($result);
+            $respondError(400, (string)$result['error']);
+        }
+
+        $isChunkIntermediate = isset($result['status']) && (string)$result['status'] === 'chunk uploaded';
+        $isSuccess = isset($result['success']) && !$isChunkIntermediate;
+
+        if ($isSuccess) {
+            self::incrementSharedDailyQuota($tokenHash, $sizeBytes);
+            $folderKey = ACL::normalizeFolder($targetFolder);
+            $effectiveRelPath = $relativePath !== '' ? str_replace('\\', '/', ltrim($relativePath, '/')) : $filename;
+            $loggedPath = ($folderKey === 'root' || $folderKey === '')
+                ? $effectiveRelPath
+                : ($folderKey . '/' . $effectiveRelPath);
+            self::logSharedUploadSubmission($tokenHash, $clientIp, $loggedPath, $sizeBytes);
+        }
+
+        if ($isSuccess && !$wantsJson && !$isChunkUpload) {
+            $_SESSION['upload_message'] = "File uploaded successfully.";
+            $redirectUrl = fr_with_base_path("/api/folder/shareFolder.php?token=" . urlencode($token));
+            if ($providedPass !== '') {
+                $redirectUrl .= "&pass=" . urlencode($providedPass);
+            }
+            if ($subPath !== '') {
+                $redirectUrl .= "&path=" . urlencode($subPath);
+            }
+            header("Location: " . $redirectUrl);
             exit;
         }
 
-        $folderKey = (string)($result['folder'] ?? 'root');
-        $newFilename = (string)($result['newFilename'] ?? '');
-        if ($newFilename !== '') {
-            AuditHook::log('file.upload', [
-                'user'   => 'share:' . $token,
-                'source' => 'share',
-                'folder' => $folderKey !== '' ? $folderKey : 'root',
-                'path'   => ($folderKey !== '' && $folderKey !== 'root') ? ($folderKey . '/' . $newFilename) : $newFilename,
-                'meta'   => [
-                    'token' => $token,
-                ],
-            ]);
-        }
-
-        $_SESSION['upload_message'] = "File uploaded successfully.";
-        $redirectUrl = fr_with_base_path("/api/folder/shareFolder.php?token=" . urlencode($token));
-        if ($providedPass !== '') {
-            $redirectUrl .= "&pass=" . urlencode($providedPass);
-        }
-        if ($subPath !== '') {
-            $redirectUrl .= "&path=" . urlencode($subPath);
-        }
-        header("Location: " . $redirectUrl);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode($result);
         exit;
     }
 

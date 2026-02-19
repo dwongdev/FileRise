@@ -67,6 +67,7 @@ export function updateFileActionButtons() {
   const extractZipBtn = document.getElementById("extractZipBtn");
   const createBtn = document.getElementById("createBtn");
   const renameBtn = document.getElementById("renameSelectedBtn");
+  const linkBtn = document.getElementById("linkSelectedBtn");
   const shareBtn = document.getElementById("shareSelectedBtn");
   const folderActionsInline = document.getElementById("folderActionsInline");
   const folderMoveBtn = document.getElementById("folderMoveInlineBtn");
@@ -96,6 +97,7 @@ export function updateFileActionButtons() {
   const allowMove     = currentFolderCaps ? !!(currentFolderCaps.canMoveIn || currentFolderCaps.canMove) : true;
   const allowRename   = currentFolderCaps ? !!(currentFolderCaps.canRename || currentFolderCaps.isAdmin) : true;
   const allowDelete   = currentFolderCaps ? !!currentFolderCaps.canDelete : true;
+  const allowLink     = currentFolderCaps ? !!(currentFolderCaps.canView || currentFolderCaps.canViewOwn) : true;
   const allowShare    = currentFolderCaps ? !!(currentFolderCaps.canShareFile || currentFolderCaps.canShare) : true;
   const allowExtract  = currentFolderCaps ? !!currentFolderCaps.canExtract : true;
   const inEncryptedFolder = !!(currentFolderCaps && currentFolderCaps.encryption && currentFolderCaps.encryption.encrypted);
@@ -183,6 +185,7 @@ export function updateFileActionButtons() {
   if (moveBtn) moveBtn.style.display = showFileActions ? "" : "none";
   if (zipBtn) zipBtn.style.display = showFileActions ? "" : "none";
   if (renameBtn) renameBtn.style.display = showFileActions ? "" : "none";
+  if (linkBtn) linkBtn.style.display = showFileActions ? "" : "none";
   if (shareBtn) shareBtn.style.display = (showFileActions && !inEncryptedFolder) ? "" : "none";
   if (createBtn) createBtn.style.display = "";
 
@@ -196,6 +199,7 @@ export function updateFileActionButtons() {
   setEnabled(moveBtn,   showFileActions && anySelected && allowMove);
   setEnabled(zipBtn,    showFileActions && anySelected && allowDownload);
   setEnabled(renameBtn, showFileActions && singleSelected && allowRename);
+  setEnabled(linkBtn,   showFileActions && singleSelected && allowLink);
   setEnabled(shareBtn,  showFileActions && singleSelected && allowShare && !inEncryptedFolder);
   setEnabled(extractZipBtn, showFileActions && anyZip && allowExtract && !inEncryptedFolder);
 

@@ -38,6 +38,8 @@ Built for homelabs, teams, and client portals that need fast browsing, strict AC
 
 - 💾 **Self-hosted “cloud drive”** – Runs anywhere with PHP (or via Docker). No external database required.
 - 🔐 **Granular per-folder ACLs** – Manage View (all/own), Upload, Create, Edit, Rename, Move, Copy, Delete, Extract, Share, and more — all enforced consistently across the UI, API, and WebDAV.
+- 🔗 **Link File (authenticated deep links)** – Generate internal links to specific files, require login + ACL checks, and open directly to the target in the app.
+- 📥 **File Request links (upload-only)** – Share upload-only links so external users can submit files into a folder without browsing existing files.
 - 🔐 **Folder-level encryption at rest (optional)** – Encrypt entire folders (and all descendants) on disk using modern authenticated encryption.
   - Opt-in per folder with inherited protection for subfolders
   - Files are stored encrypted on disk and transparently decrypted on download

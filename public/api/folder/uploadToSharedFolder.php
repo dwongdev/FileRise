@@ -19,7 +19,14 @@
  *           @OA\Property(property="token", type="string", description="Share token"),
  *           @OA\Property(property="pass", type="string", description="Share password (if required)"),
  *           @OA\Property(property="path", type="string", description="Optional subfolder path within the shared folder"),
- *           @OA\Property(property="fileToUpload", type="string", format="binary", description="File to upload")
+ *           @OA\Property(property="relativePath", type="string", description="Optional relative path for folder uploads"),
+ *           @OA\Property(property="fileToUpload", type="string", format="binary", description="File to upload"),
+ *           @OA\Property(property="resumableChunkNumber", type="integer", description="Chunk number for chunked upload"),
+ *           @OA\Property(property="resumableTotalChunks", type="integer", description="Total chunks"),
+ *           @OA\Property(property="resumableIdentifier", type="string", description="Chunk upload identifier"),
+ *           @OA\Property(property="resumableFilename", type="string", description="Original file name"),
+ *           @OA\Property(property="resumableRelativePath", type="string", description="Original relative path"),
+ *           @OA\Property(property="file", type="string", format="binary", description="Chunk payload when chunked")
  *         )
  *       )
  *     }

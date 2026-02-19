@@ -19,7 +19,15 @@
  *       @OA\Property(property="expirationUnit", type="string", enum={"seconds","minutes","hours","days"}, example="minutes"),
  *       @OA\Property(property="password", type="string", example=""),
  *       @OA\Property(property="allowUpload", type="integer", enum={0,1}, example=0),
- *       @OA\Property(property="allowSubfolders", type="integer", enum={0,1}, example=0)
+ *       @OA\Property(property="allowSubfolders", type="integer", enum={0,1}, example=0),
+ *       @OA\Property(property="mode", type="string", enum={"browse","drop"}, example="drop"),
+ *       @OA\Property(property="fileDrop", type="integer", enum={0,1}, example=1),
+ *       @OA\Property(property="hideListing", type="integer", enum={0,1}, example=1),
+ *       @OA\Property(property="preserveFolderStructure", type="integer", enum={0,1}, example=1),
+ *       @OA\Property(property="maxFileSizeMb", type="integer", example=100),
+ *       @OA\Property(property="allowedTypes", type="array", @OA\Items(type="string", example="pdf")),
+ *       @OA\Property(property="dailyFileLimit", type="integer", example=250),
+ *       @OA\Property(property="maxTotalMbPerDay", type="integer", example=2048)
  *     )
  *   ),
  *   @OA\Response(

@@ -2251,6 +2251,104 @@ class FolderModel
         return $folderInfoList;
     }
 
+    private static function boolFromMixed($value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_int($value) || is_float($value)) {
+            return ((int)$value) !== 0;
+        }
+        $s = strtolower(trim((string)$value));
+        return in_array($s, ['1', 'true', 'yes', 'on'], true);
+    }
+
+    private static function intFromMixed($value, int $min = 0, int $max = 0): int
+    {
+        if (!is_numeric($value)) {
+            return $min;
+        }
+        $n = (int)$value;
+        if ($n < $min) {
+            $n = $min;
+        }
+        if ($max > 0 && $n > $max) {
+            $n = $max;
+        }
+        return $n;
+    }
+
+    private static function normalizeShareModeValue($mode, bool $hideListing): string
+    {
+        $m = strtolower(trim((string)$mode));
+        if ($m === 'drop' || $hideListing) {
+            return 'drop';
+        }
+        return 'browse';
+    }
+
+    private static function normalizeShareAllowedTypes($raw): array
+    {
+        $items = [];
+        if (is_string($raw)) {
+            $parts = preg_split('/[\s,;]+/', $raw) ?: [];
+            $items = $parts;
+        } elseif (is_array($raw)) {
+            $items = $raw;
+        }
+
+        $out = [];
+        foreach ($items as $it) {
+            $ext = strtolower(trim((string)$it));
+            $ext = ltrim($ext, '.');
+            if ($ext === '') {
+                continue;
+            }
+            if (!preg_match('/^[a-z0-9][a-z0-9._+-]{0,31}$/', $ext)) {
+                continue;
+            }
+            $out[$ext] = $ext;
+        }
+        return array_values($out);
+    }
+
+    private static function normalizeShareFolderRecord(array $record): array
+    {
+        $hideListing = self::boolFromMixed($record['hideListing'] ?? false);
+        $mode = self::normalizeShareModeValue($record['mode'] ?? '', $hideListing);
+
+        $allowUpload = self::boolFromMixed($record['allowUpload'] ?? 0) ? 1 : 0;
+        if ($mode === 'drop') {
+            $allowUpload = 1;
+            $hideListing = true;
+        }
+
+        $record['mode'] = $mode;
+        $record['allowUpload'] = $allowUpload;
+        $record['hideListing'] = $hideListing ? 1 : 0;
+        $record['allowSubfolders'] = self::boolFromMixed($record['allowSubfolders'] ?? 0) ? 1 : 0;
+        $record['preserveFolderStructure'] = self::boolFromMixed($record['preserveFolderStructure'] ?? 1) ? 1 : 0;
+        $record['maxFileSizeMb'] = self::intFromMixed($record['maxFileSizeMb'] ?? 0, 0, 102400);
+        $record['dailyFileLimit'] = self::intFromMixed($record['dailyFileLimit'] ?? 0, 0, 2000000);
+        $record['maxTotalMbPerDay'] = self::intFromMixed($record['maxTotalMbPerDay'] ?? 0, 0, 2000000);
+        $record['allowedTypes'] = self::normalizeShareAllowedTypes($record['allowedTypes'] ?? []);
+        $createdBy = trim((string)($record['createdBy'] ?? ($record['user'] ?? ($record['username'] ?? ''))));
+        $createdBy = preg_replace('/[\x00-\x1F\x7F]/', '', $createdBy);
+        if (is_string($createdBy) && $createdBy !== '') {
+            $record['createdBy'] = $createdBy;
+        }
+        if (isset($record['createdAt']) && is_numeric($record['createdAt'])) {
+            $record['createdAt'] = max(0, (int)$record['createdAt']);
+        }
+        return $record;
+    }
+
+    private static function isShareDropMode(array $record): bool
+    {
+        $normalized = self::normalizeShareFolderRecord($record);
+        return ($normalized['mode'] ?? 'browse') === 'drop' || !empty($normalized['hideListing']);
+    }
+
     private static function findShareFolderRecord(string $token): ?array
     {
         $token = (string)$token;
@@ -2262,7 +2360,11 @@ class FolderModel
             if (!is_array($shareLinks) || !isset($shareLinks[$token])) {
                 return null;
             }
-            return $shareLinks[$token];
+            $rec = $shareLinks[$token];
+            if (!is_array($rec)) {
+                return null;
+            }
+            return self::normalizeShareFolderRecord($rec);
         };
 
         $currentId = class_exists('SourceContext') ? SourceContext::getActiveId() : '';
@@ -2431,7 +2533,7 @@ class FolderModel
         return array_merge($folders, $files);
     }
 
-    private static function resolveSharedFolderContext(string $token, ?string $providedPass, string $subPath = ''): array
+    private static function resolveSharedFolderContext(string $token, ?string $providedPass, string $subPath = '', bool $includeEntries = true): array
     {
         $record = self::findShareFolderRecord($token);
         if (!$record) {
@@ -2461,6 +2563,7 @@ class FolderModel
         }
 
         $allowSubfolders = !empty($record['allowSubfolders']);
+        $hideListing = !empty($record['hideListing']) || self::isShareDropMode($record);
         [$normalizedSubPath, $pathErr] = self::normalizeShareSubPath($subPath);
         if ($pathErr) {
             return ["error" => $pathErr];
@@ -2491,11 +2594,14 @@ class FolderModel
             return ["error" => "Shared folder not found."];
         }
 
-        $allEntries = self::listSharedFolderEntries($storage, $realFolderPath);
-        if (!$allowSubfolders) {
-            $allEntries = array_values(array_filter($allEntries, function ($entry) {
-                return (($entry['type'] ?? '') !== 'folder');
-            }));
+        $allEntries = [];
+        if ($includeEntries && !$hideListing) {
+            $allEntries = self::listSharedFolderEntries($storage, $realFolderPath);
+            if (!$allowSubfolders) {
+                $allEntries = array_values(array_filter($allEntries, function ($entry) {
+                    return (($entry['type'] ?? '') !== 'folder');
+                }));
+            }
         }
 
         return [
@@ -2506,6 +2612,9 @@ class FolderModel
             "realFolderPath" => $realFolderPath,
             "entries"       => $allEntries,
             "allowSubfolders" => $allowSubfolders ? 1 : 0,
+            "mode"          => (string)($record['mode'] ?? 'browse'),
+            "hideListing"   => $hideListing ? 1 : 0,
+            "preserveFolderStructure" => !empty($record['preserveFolderStructure']) ? 1 : 0,
         ];
     }
 
@@ -2523,6 +2632,15 @@ class FolderModel
         if (isset($ctx['error']) || isset($ctx['needs_password'])) {
             return $ctx;
         }
+
+        if (!empty($ctx['hideListing'])) {
+            $ctx['entries'] = [];
+            $ctx['currentPage'] = 1;
+            $ctx['totalPages'] = 1;
+            $ctx['totalEntries'] = 0;
+            return $ctx;
+        }
+
         $allEntries = $ctx['entries'] ?? [];
 
         $totalEntries = count($allEntries);
@@ -2538,11 +2656,30 @@ class FolderModel
         return $ctx;
     }
 
+    public static function getSharedUploadContext(string $token, ?string $providedPass, string $subPath = ''): array
+    {
+        $ctx = self::resolveSharedFolderContext($token, $providedPass, $subPath, false);
+        if (isset($ctx['error']) || isset($ctx['needs_password'])) {
+            return $ctx;
+        }
+        $record = is_array($ctx['record'] ?? null) ? $ctx['record'] : [];
+        if (empty($record['allowUpload']) || (int)$record['allowUpload'] !== 1) {
+            return ['error' => 'File uploads are not allowed for this share.'];
+        }
+        return $ctx;
+    }
+
     /**
      * Creates a share link for a folder.
      */
-    public static function createShareFolderLink(string $folder, int $expirationSeconds = 3600, string $password = "", int $allowUpload = 0, int $allowSubfolders = 0): array
-    {
+    public static function createShareFolderLink(
+        string $folder,
+        int $expirationSeconds = 3600,
+        string $password = "",
+        int $allowUpload = 0,
+        int $allowSubfolders = 0,
+        array $options = []
+    ): array {
         try {
             if (FolderCrypto::isEncryptedOrAncestor($folder)) {
                 return ["error" => "Sharing is disabled inside encrypted folders."];
@@ -2563,6 +2700,32 @@ class FolderModel
         } catch (\Throwable $e) {
             return ["error" => "Could not generate token."];
         }
+
+        $modeRaw = $options['mode'] ?? '';
+        if (($modeRaw === '' || $modeRaw === null) && !empty($options['fileDrop'])) {
+            $modeRaw = 'drop';
+        }
+        $mode = self::normalizeShareModeValue($modeRaw, false);
+        $hideListing = array_key_exists('hideListing', $options)
+            ? self::boolFromMixed($options['hideListing'])
+            : ($mode === 'drop');
+        if ($mode === 'drop') {
+            $allowUpload = 1;
+            $hideListing = true;
+        }
+
+        $preserveFolderStructure = array_key_exists('preserveFolderStructure', $options)
+            ? self::boolFromMixed($options['preserveFolderStructure'])
+            : true;
+        $maxFileSizeMb = self::intFromMixed($options['maxFileSizeMb'] ?? 0, 0, 102400);
+        $dailyFileLimit = self::intFromMixed($options['dailyFileLimit'] ?? 0, 0, 2000000);
+        $maxTotalMbPerDay = self::intFromMixed($options['maxTotalMbPerDay'] ?? 0, 0, 2000000);
+        $allowedTypes = self::normalizeShareAllowedTypes($options['allowedTypes'] ?? []);
+        $createdBy = trim((string)($options['createdBy'] ?? ''));
+        $createdBy = preg_replace('/[\x00-\x1F\x7F]/', '', $createdBy);
+        $createdAt = isset($options['createdAt']) && is_numeric($options['createdAt'])
+            ? max(0, (int)$options['createdAt'])
+            : time();
 
         $expires       = time() + max(1, $expirationSeconds);
         $hashedPassword = $password !== "" ? password_hash($password, PASSWORD_DEFAULT) : "";
@@ -2585,7 +2748,16 @@ class FolderModel
             "expires"     => $expires,
             "password"    => $hashedPassword,
             "allowUpload" => $allowUpload ? 1 : 0,
-            "allowSubfolders" => $allowSubfolders ? 1 : 0
+            "allowSubfolders" => $allowSubfolders ? 1 : 0,
+            "mode" => $mode,
+            "hideListing" => $hideListing ? 1 : 0,
+            "preserveFolderStructure" => $preserveFolderStructure ? 1 : 0,
+            "maxFileSizeMb" => $maxFileSizeMb,
+            "allowedTypes" => $allowedTypes,
+            "dailyFileLimit" => $dailyFileLimit,
+            "maxTotalMbPerDay" => $maxTotalMbPerDay,
+            "createdBy" => is_string($createdBy) ? $createdBy : '',
+            "createdAt" => $createdAt,
         ];
 
         if (file_put_contents($shareFile, json_encode($links, JSON_PRETTY_PRINT), LOCK_EX) === false) {
@@ -2605,7 +2777,7 @@ class FolderModel
             $link    = $baseUrl . fr_with_base_path("/api/folder/shareFolder.php?token=" . urlencode($token));
         }
 
-        return ["token" => $token, "expires" => $expires, "link" => $link];
+        return ["token" => $token, "expires" => $expires, "link" => $link, "mode" => $mode];
     }
 
     /**
@@ -2627,6 +2799,10 @@ class FolderModel
         }
         if (!empty($record['password']) && !password_verify((string)$providedPass, $record['password'])) {
             return ["error" => "Invalid password."];
+        }
+
+        if (self::isShareDropMode($record)) {
+            return ["error" => "Downloads are disabled for this upload-only share."];
         }
 
         // Encrypted folders/descendants: shared access is blocked (v1).
@@ -2905,7 +3081,17 @@ class FolderModel
             return [];
         }
         $links = json_decode(file_get_contents($shareFile), true);
-        return is_array($links) ? $links : [];
+        if (!is_array($links)) {
+            return [];
+        }
+        $out = [];
+        foreach ($links as $token => $record) {
+            if (!is_array($record)) {
+                continue;
+            }
+            $out[(string)$token] = self::normalizeShareFolderRecord($record);
+        }
+        return $out;
     }
 
     public static function deleteShareFolderLink(string $token): bool

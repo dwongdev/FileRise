@@ -1,6 +1,22 @@
 // sharedFolderView.js
+import { setLocale, t } from './i18n.js?v={{APP_QVER}}';
 
-document.addEventListener('DOMContentLoaded', function () {
+document.addEventListener('DOMContentLoaded', async function () {
+  try {
+    const saved = localStorage.getItem('language') || 'en';
+    await setLocale(saved);
+  } catch (e) {
+    await setLocale('en');
+  }
+
+  const tx = (key, placeholders, fallback) => {
+    const out = t(key, placeholders);
+    if (out === key && typeof fallback === 'string') {
+      return fallback;
+    }
+    return out;
+  };
+
   const dataEl = document.getElementById('shared-data');
   if (!dataEl) return;
 
@@ -62,6 +78,10 @@ document.addEventListener('DOMContentLoaded', function () {
     return (storedTheme === 'light' || storedTheme === 'dark') ? storedTheme : getSystemTheme();
   }
 
+  function isFileLike(file) {
+    return !!file && typeof file === 'object' && typeof file.name === 'string';
+  }
+
   function applyTheme(theme) {
     if (theme === 'light' || theme === 'dark') {
       document.documentElement.setAttribute('data-share-theme', theme);
@@ -112,6 +132,45 @@ document.addEventListener('DOMContentLoaded', function () {
     const progressWrap = document.getElementById('shareUploadProgress');
     const progressFill = progressWrap ? progressWrap.querySelector('.fr-share-upload-progress-fill') : null;
     const progressText = document.getElementById('shareUploadProgressText');
+    const uploadErrorId = 'shareUploadError';
+
+    const ensureUploadErrorEl = () => {
+      let el = document.getElementById(uploadErrorId);
+      if (el) return el;
+
+      el = document.createElement('div');
+      el.id = uploadErrorId;
+      el.className = 'fr-share-alert fr-share-alert-error fr-share-upload-error';
+      el.setAttribute('role', 'alert');
+      el.hidden = true;
+
+      const anchor = progressWrap || uploadForm;
+      if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(el, anchor.nextSibling);
+      } else if (uploadForm && uploadForm.parentNode) {
+        uploadForm.parentNode.appendChild(el);
+      }
+      return el;
+    };
+
+    const hideUploadError = () => {
+      const el = document.getElementById(uploadErrorId);
+      if (!el) return;
+      el.hidden = true;
+      el.textContent = '';
+    };
+
+    const showUploadError = (message, statusCode) => {
+      const el = ensureUploadErrorEl();
+      if (!el) return;
+      const reason = String(message || tx('share_upload_failed', null, 'Upload failed.')).trim()
+        || tx('share_upload_failed', null, 'Upload failed.');
+      const code = Number.isFinite(statusCode) && statusCode > 0 ? Math.trunc(statusCode) : 0;
+      el.textContent = code > 0
+        ? tx('share_upload_failed_http', { code, reason }, 'Upload failed (HTTP ' + code + '): ' + reason)
+        : tx('share_upload_failed_message', { reason }, 'Upload failed: ' + reason);
+      el.hidden = false;
+    };
 
     const setBusy = (busy) => {
       if (submitBtn) submitBtn.disabled = !!busy;
@@ -123,26 +182,32 @@ document.addEventListener('DOMContentLoaded', function () {
       progressWrap.hidden = false;
       progressWrap.classList.remove('is-error', 'is-indeterminate');
       if (progressFill) progressFill.style.width = '0%';
-      if (progressText) progressText.textContent = 'Uploading...';
+      if (progressText) progressText.textContent = tx('share_uploading', null, 'Uploading...');
     };
 
     const setIndeterminate = () => {
       if (!progressWrap) return;
       progressWrap.classList.add('is-indeterminate');
-      if (progressText) progressText.textContent = 'Uploading...';
+      if (progressText) progressText.textContent = tx('share_uploading', null, 'Uploading...');
     };
 
     const setProgress = (pct) => {
       if (progressWrap) progressWrap.classList.remove('is-indeterminate');
       if (progressFill) progressFill.style.width = pct + '%';
-      if (progressText) progressText.textContent = 'Uploading... ' + pct + '%';
+      if (progressText) {
+        progressText.textContent = tx(
+          'share_uploading_progress',
+          { pct },
+          'Uploading... ' + pct + '%'
+        );
+      }
     };
 
     const setError = (msg) => {
       if (!progressWrap) return;
       progressWrap.classList.remove('is-indeterminate');
       progressWrap.classList.add('is-error');
-      if (progressText) progressText.textContent = msg || 'Upload failed.';
+      if (progressText) progressText.textContent = msg || tx('share_upload_failed', null, 'Upload failed.');
     };
 
     uploadForm.addEventListener('submit', function (e) {
@@ -154,13 +219,17 @@ document.addEventListener('DOMContentLoaded', function () {
 
       e.preventDefault();
       uploadForm.dataset.busy = '1';
+      hideUploadError();
       showProgress();
 
       const formData = new FormData(uploadForm);
       const fileKey = (fileInput && fileInput.name) ? fileInput.name : 'fileToUpload';
       const existingFile = formData.get(fileKey);
-      if (!(existingFile instanceof File) || !existingFile.name) {
-        formData.set(fileKey, fileInput.files[0]);
+      if (!isFileLike(existingFile)) {
+        const selectedFile = fileInput.files[0];
+        if (selectedFile) {
+          formData.set(fileKey, selectedFile);
+        }
       }
       setBusy(true);
 
@@ -179,8 +248,15 @@ document.addEventListener('DOMContentLoaded', function () {
       xhr.addEventListener('load', function () {
         const ok = xhr.status >= 200 && xhr.status < 300;
         if (ok) {
+          hideUploadError();
           if (progressFill) progressFill.style.width = '100%';
-          if (progressText) progressText.textContent = 'Upload complete. Refreshing...';
+          if (progressText) {
+            progressText.textContent = tx(
+              'share_upload_complete_refreshing',
+              null,
+              'Upload complete. Refreshing...'
+            );
+          }
           window.location.reload();
           return;
         }
@@ -190,13 +266,15 @@ document.addEventListener('DOMContentLoaded', function () {
           const data = JSON.parse(xhr.responseText || '{}');
           if (data && data.error) msg = String(data.error);
         } catch (err) { }
-        setError(msg || 'Upload failed.');
+        showUploadError(msg || tx('share_upload_failed', null, 'Upload failed.'), xhr.status || 0);
+        setError(msg || tx('share_upload_failed', null, 'Upload failed.'));
         uploadForm.dataset.busy = '0';
         setBusy(false);
       });
 
       xhr.addEventListener('error', function () {
-        setError('Upload failed. Please try again.');
+        showUploadError(tx('share_upload_network_error', null, 'Network error. Please check your connection and try again.'), 0);
+        setError(tx('share_upload_failed', null, 'Upload failed.'));
         uploadForm.dataset.busy = '0';
         setBusy(false);
       });

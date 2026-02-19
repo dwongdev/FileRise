@@ -246,6 +246,37 @@ class FileController
         return false;
     }
 
+    private function enforceSingleFileReadAccess(string $folder, string $file, string $username, array $perms): ?string
+    {
+        $ignoreOwnership = $this->isAdmin($perms)
+            || ($perms['bypassOwnership'] ?? (defined('DEFAULT_BYPASS_OWNERSHIP') ? DEFAULT_BYPASS_OWNERSHIP : false))
+            || ACL::isOwner($username, $perms, $folder)
+            || $this->ownsFolderOrAncestor($folder, $username, $perms);
+
+        $fullView = $ignoreOwnership
+            || ACL::canRead($username, $perms, $folder)
+            || $this->ownsFolderOrAncestor($folder, $username, $perms);
+        $ownGrant = !$fullView && ACL::hasGrant($username, $folder, 'read_own');
+        if (!$fullView && !$ownGrant) {
+            return 'Forbidden: no view access to this folder.';
+        }
+
+        $scopeNeed = $fullView ? 'read' : 'read_own';
+        $scopeErr = $this->enforceFolderScope($folder, $username, $perms, $scopeNeed);
+        if ($scopeErr) {
+            return $scopeErr;
+        }
+
+        if ($ownGrant) {
+            $meta = $this->loadFolderMetadata($folder);
+            if (!isset($meta[$file]['uploader']) || strcasecmp((string)$meta[$file]['uploader'], $username) !== 0) {
+                return 'Forbidden: you are not the owner of this file.';
+            }
+        }
+
+        return null;
+    }
+
     /**
      * Enforce per-folder scope when the account is in "folder-only" mode.
      * $need: 'read' (default) | 'write' | 'manage' | 'share' | 'read_own'
@@ -4291,6 +4322,210 @@ class FileController
         exit;
     }
 
+    public function createAuthFileLink(): void
+    {
+        $this->jsonStart();
+        try {
+            if (!$this->requireAuth()) {
+                return;
+            }
+            if (!$this->checkCsrf()) {
+                return;
+            }
+
+            $input = $this->readJsonBody();
+            if (!is_array($input) || !$input) {
+                $this->jsonOut(['error' => 'Invalid input.'], 400);
+                return;
+            }
+
+            $folder = $this->normalizeFolder($input['folder'] ?? '');
+            $file = basename((string)($input['file'] ?? ''));
+            if (!$this->validFolder($folder)) {
+                $this->jsonOut(['error' => 'Invalid folder name.'], 400);
+                return;
+            }
+            if (!$this->validFile($file)) {
+                $this->jsonOut(['error' => 'Invalid file name.'], 400);
+                return;
+            }
+
+            $rawSourceId = trim((string)($input['sourceId'] ?? ''));
+            $sourceId = $this->normalizeSourceId($rawSourceId);
+            if ($rawSourceId !== '' && $sourceId === '') {
+                $this->jsonOut(['error' => 'Invalid source id.'], 400);
+                return;
+            }
+            $expiresAt = null;
+            if (isset($input['expiresAt'])) {
+                $rawExpiresAt = (int)$input['expiresAt'];
+                if ($rawExpiresAt > 0) {
+                    $expiresAt = $rawExpiresAt;
+                }
+            } elseif (isset($input['expiresInSeconds'])) {
+                $expiresIn = (int)$input['expiresInSeconds'];
+                if ($expiresIn > 0) {
+                    $expiresIn = min($expiresIn, 365 * 86400);
+                    $expiresAt = time() + $expiresIn;
+                }
+            }
+
+            $username = $_SESSION['username'] ?? '';
+            $perms = $this->loadPerms($username);
+
+            $runner = function () use ($folder, $file, $username, $perms, $expiresAt): void {
+                $accessErr = $this->enforceSingleFileReadAccess($folder, $file, $username, $perms);
+                if ($accessErr) {
+                    $this->jsonOut(['error' => $accessErr], 403);
+                    return;
+                }
+
+                $downloadInfo = FileModel::getDownloadInfo($folder, $file);
+                if (isset($downloadInfo['error'])) {
+                    $status = in_array($downloadInfo['error'], ['File not found.', 'Access forbidden.'], true) ? 404 : 400;
+                    $this->jsonOut(['error' => $downloadInfo['error']], $status);
+                    return;
+                }
+
+                $effectiveSourceId = '';
+                if (class_exists('SourceContext') && SourceContext::sourcesEnabled()) {
+                    $effectiveSourceId = SourceContext::getActiveId();
+                }
+
+                $result = FileModel::createAuthFileLink(
+                    $folder,
+                    $file,
+                    $effectiveSourceId,
+                    (string)$username,
+                    $expiresAt
+                );
+                if (isset($result['error'])) {
+                    $this->jsonOut(['error' => $result['error']], 500);
+                    return;
+                }
+
+                $token = (string)($result['token'] ?? '');
+                if ($token === '') {
+                    $this->jsonOut(['error' => 'Could not create file link.'], 500);
+                    return;
+                }
+
+                AuditHook::log('file.link.create', [
+                    'user'   => $username,
+                    'folder' => $folder,
+                    'path'   => ($folder === 'root') ? $file : ($folder . '/' . $file),
+                    'meta'   => [
+                        'tokenHash' => substr(hash('sha256', $token), 0, 24),
+                        'sourceId' => $effectiveSourceId,
+                    ],
+                ]);
+
+                $payload = [
+                    'ok' => true,
+                    'token' => $token,
+                    'url' => fr_with_base_path('/index.html?fileLink=' . rawurlencode($token)),
+                    'sourceId' => $effectiveSourceId,
+                ];
+                if (isset($result['expiresAt']) && !is_null($result['expiresAt'])) {
+                    $payload['expiresAt'] = (int)$result['expiresAt'];
+                }
+                $this->jsonOut($payload, 200);
+            };
+
+            if ($sourceId !== '' && class_exists('SourceContext') && SourceContext::sourcesEnabled()) {
+                $info = SourceContext::getSourceById($sourceId);
+                if (!$info) {
+                    $this->jsonOut(['error' => 'Invalid source id.'], 400);
+                    return;
+                }
+                if (empty($info['enabled'])) {
+                    $this->jsonOut(['error' => 'Source is disabled.'], 403);
+                    return;
+                }
+                $this->withSourceContext($sourceId, $runner, false);
+                return;
+            }
+
+            $runner();
+        } catch (Throwable $e) {
+            error_log('FileController::createAuthFileLink error: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+            $this->jsonOut(['error' => 'Internal server error while creating file link.'], 500);
+        } finally {
+            $this->jsonEnd();
+        }
+    }
+
+    public function resolveAuthFileLink(): void
+    {
+        $this->jsonStart();
+        try {
+            if (!$this->requireAuth()) {
+                return;
+            }
+
+            $token = strtolower(trim((string)($_GET['token'] ?? '')));
+            if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
+                $this->jsonOut(['error' => 'Invalid token.'], 400);
+                return;
+            }
+
+            $record = FileModel::getAuthFileLinkRecord($token);
+            if (!$record || !is_array($record)) {
+                $this->jsonOut(['error' => 'Link is invalid or expired.'], 404);
+                return;
+            }
+
+            $folder = $this->normalizeFolder($record['folder'] ?? 'root');
+            $file = basename((string)($record['file'] ?? ''));
+            if (!$this->validFolder($folder) || !$this->validFile($file)) {
+                $this->jsonOut(['error' => 'Link is invalid or expired.'], 404);
+                return;
+            }
+
+            $recordSourceId = $this->normalizeSourceId($record['sourceId'] ?? '');
+            $username = $_SESSION['username'] ?? '';
+            $perms = $this->loadPerms($username);
+
+            $runner = function () use ($folder, $file, $username, $perms, $recordSourceId): void {
+                $accessErr = $this->enforceSingleFileReadAccess($folder, $file, $username, $perms);
+                if ($accessErr) {
+                    $this->jsonOut(['error' => 'Forbidden: no view access to this folder.'], 403);
+                    return;
+                }
+
+                $downloadInfo = FileModel::getDownloadInfo($folder, $file);
+                if (isset($downloadInfo['error'])) {
+                    $this->jsonOut(['error' => 'Link is invalid or expired.'], 404);
+                    return;
+                }
+
+                $this->jsonOut([
+                    'ok' => true,
+                    'folder' => $folder,
+                    'file' => $file,
+                    'sourceId' => $recordSourceId,
+                ], 200);
+            };
+
+            if ($recordSourceId !== '' && class_exists('SourceContext') && SourceContext::sourcesEnabled()) {
+                $info = SourceContext::getSourceById($recordSourceId);
+                if (!$info || empty($info['enabled'])) {
+                    $this->jsonOut(['error' => 'Link is invalid or expired.'], 404);
+                    return;
+                }
+                $this->withSourceContext($recordSourceId, $runner, false);
+                return;
+            }
+
+            $runner();
+        } catch (Throwable $e) {
+            error_log('FileController::resolveAuthFileLink error: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+            $this->jsonOut(['error' => 'Internal server error while resolving file link.'], 500);
+        } finally {
+            $this->jsonEnd();
+        }
+    }
+
     public function createShareLink()
     {
         $this->jsonStart();
@@ -4388,7 +4623,7 @@ class FileController
                     break;
             }
 
-            $result = FileModel::createShareLink($folder, $file, $expirationSeconds, $password);
+            $result = FileModel::createShareLink($folder, $file, $expirationSeconds, $password, (string)$username);
             if (isset($result['token'])) {
                 AuditHook::log('share.link.create', [
                     'user'   => $username,

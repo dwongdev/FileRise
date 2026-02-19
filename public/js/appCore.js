@@ -169,9 +169,10 @@ export function initializeApp() {
   loadHeaderOrder();
   initFileActions();
   initUpload();
-  initSourceSelector().finally(() => {
+  const sourceInitPromise = initSourceSelector().finally(() => {
     loadFolderTree();
   });
+  window.__frSourceInitPromise = sourceInitPromise;
 
   // Only run trash/restore for admins
   const isAdmin =

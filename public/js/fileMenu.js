@@ -7,6 +7,7 @@ import {
   renameFile, openCreateFileModal
 } from './fileActions.js?v={{APP_QVER}}';
 import { previewFile, buildPreviewUrl, openShareModal } from './filePreview.js?v={{APP_QVER}}';
+import { openFileLinkModal } from './fileLink.js?v={{APP_QVER}}';
 import { editFile } from './fileEditor.js?v={{APP_QVER}}';
 import { canEditFile, fileData, downloadSelectedFilesIndividually, startInlineRenameFromContext } from './fileListView.js?v={{APP_QVER}}';
 import { openTagModal, openMultiTagModal } from './fileTags.js?v={{APP_QVER}}';
@@ -32,6 +33,7 @@ function localizeMenu() {
     'tag_file': 'tag_file',
     // NEW:
     'download_plain': 'download_plain',
+    'link_file': 'link_file',
     'share_file': 'share_file'
   };
   Object.entries(map).forEach(([action, key]) => {
@@ -41,7 +43,7 @@ function localizeMenu() {
 }
 
 // Show/hide items based on selection state
-function configureVisibility({ any, one, many, anyZip, canEdit, allowShare, allowZip, allowExtractZip }) {
+function configureVisibility({ any, one, many, anyZip, canEdit, allowLink, allowShare, allowZip, allowExtractZip }) {
   const m = qMenu(); if (!m) return;
 
   const show = (sel, on) => sel.forEach(el => el.hidden = !on);
@@ -55,6 +57,8 @@ function configureVisibility({ any, one, many, anyZip, canEdit, allowShare, allo
 
   // Capability gates (e.g. encrypted folders disable share/zip actions)
   try {
+    const link = m.querySelector('.mi[data-action="link_file"]');
+    if (link) link.hidden = link.hidden || !allowLink;
     const share = m.querySelector('.mi[data-action="share_file"]');
     if (share) share.hidden = share.hidden || !allowShare;
     const dlZip = m.querySelector('.mi[data-action="download_zip"]');
@@ -141,6 +145,7 @@ function currentSelection() {
   const caps = window.currentFolderCaps || null;
   const inEncrypted = !!(caps && caps.encryption && caps.encryption.encrypted);
   const allowShare = !inEncrypted && (caps ? !!(caps.canShareFile || caps.canShare) : true);
+  const allowLink = caps ? !!(caps.canView || caps.canViewOwn) : true;
   const allowExtractZip = !inEncrypted && (caps ? !!caps.canExtract : true);
   const allowZip = !inEncrypted; // zip-create is blocked inside encrypted folders
 
@@ -151,6 +156,7 @@ function currentSelection() {
     any, one, many, anyZip,
     file,
     canEdit: canEditFlag,
+    allowLink,
     allowShare,
     allowZip,
     allowExtractZip
@@ -248,6 +254,10 @@ function menuClickDelegate(ev) {
 
     case 'tag_file':
       if (s.file) openTagModal(s.file);
+      break;
+
+    case 'link_file':
+      if (s.file) openFileLinkModal(s.file, folder);
       break;
 
       case 'share_file':

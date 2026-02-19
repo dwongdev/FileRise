@@ -2766,6 +2766,199 @@ class FileModel
         return $response;
     }
 
+    private static function authFileLinksPathForMetaRoot(string $metaRoot): string
+    {
+        return rtrim($metaRoot, '/\\') . DIRECTORY_SEPARATOR . 'auth_file_links.json';
+    }
+
+    private static function readAuthFileLinks(string $path): array
+    {
+        if (!is_file($path)) {
+            return [];
+        }
+        $decoded = json_decode((string)@file_get_contents($path), true);
+        return is_array($decoded) ? $decoded : [];
+    }
+
+    private static function cleanAuthFileLinks(array $links, int $now): array
+    {
+        $cleaned = [];
+        foreach ($links as $token => $record) {
+            $token = strtolower(trim((string)$token));
+            if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
+                continue;
+            }
+            if (!is_array($record)) {
+                continue;
+            }
+
+            $folder = trim((string)($record['folder'] ?? 'root'));
+            if ($folder === '' || strtolower($folder) === 'root') {
+                $folder = 'root';
+            } elseif (!preg_match(REGEX_FOLDER_NAME, $folder)) {
+                continue;
+            }
+
+            $file = basename(trim((string)($record['file'] ?? '')));
+            if ($file === '' || !preg_match(REGEX_FILE_NAME, $file)) {
+                continue;
+            }
+
+            $expiresAt = isset($record['expiresAt']) ? (int)$record['expiresAt'] : 0;
+            if ($expiresAt > 0 && $expiresAt <= $now) {
+                continue;
+            }
+
+            $sourceId = trim((string)($record['sourceId'] ?? ''));
+            if ($sourceId !== '' && !preg_match('/^[A-Za-z0-9_-]{1,64}$/', $sourceId)) {
+                $sourceId = '';
+            }
+
+            $createdBy = trim((string)($record['createdBy'] ?? ''));
+            $createdBy = preg_replace('/[\x00-\x1F\x7F]/', '', $createdBy);
+            $createdAt = isset($record['createdAt']) ? (int)$record['createdAt'] : $now;
+            if ($createdAt <= 0) {
+                $createdAt = $now;
+            }
+
+            $cleanRecord = [
+                'folder' => $folder,
+                'file' => $file,
+                'path' => ($folder === 'root') ? $file : ($folder . '/' . $file),
+                'sourceId' => $sourceId,
+                'createdBy' => is_string($createdBy) ? $createdBy : '',
+                'createdAt' => $createdAt,
+            ];
+            if ($expiresAt > 0) {
+                $cleanRecord['expiresAt'] = $expiresAt;
+            }
+
+            $cleaned[$token] = $cleanRecord;
+        }
+        return $cleaned;
+    }
+
+    public static function createAuthFileLink(
+        string $folder,
+        string $file,
+        string $sourceId = '',
+        string $createdBy = '',
+        ?int $expiresAt = null
+    ): array {
+        if (strtolower($folder) !== 'root' && !preg_match(REGEX_FOLDER_NAME, $folder)) {
+            return ['error' => 'Invalid folder name.'];
+        }
+
+        $file = basename(trim($file));
+        if (!preg_match(REGEX_FILE_NAME, $file)) {
+            return ['error' => 'Invalid file name.'];
+        }
+
+        $sourceId = trim($sourceId);
+        if ($sourceId !== '' && !preg_match('/^[A-Za-z0-9_-]{1,64}$/', $sourceId)) {
+            $sourceId = '';
+        }
+
+        $expiresAtInt = $expiresAt ? (int)$expiresAt : 0;
+        if ($expiresAtInt < 0) {
+            $expiresAtInt = 0;
+        }
+
+        $createdBy = trim($createdBy);
+        $createdBy = preg_replace('/[\x00-\x1F\x7F]/', '', $createdBy);
+        $createdAt = time();
+        $token = bin2hex(random_bytes(32));
+
+        $path = self::authFileLinksPathForMetaRoot(self::metaRoot());
+        $links = self::readAuthFileLinks($path);
+        $links = self::cleanAuthFileLinks($links, $createdAt);
+        while (isset($links[$token])) {
+            $token = bin2hex(random_bytes(32));
+        }
+
+        $record = [
+            'folder' => $folder,
+            'file' => $file,
+            'path' => ($folder === 'root') ? $file : ($folder . '/' . $file),
+            'sourceId' => $sourceId,
+            'createdBy' => is_string($createdBy) ? $createdBy : '',
+            'createdAt' => $createdAt,
+        ];
+        if ($expiresAtInt > 0) {
+            $record['expiresAt'] = $expiresAtInt;
+        }
+        $links[$token] = $record;
+
+        if (file_put_contents($path, json_encode($links, JSON_PRETTY_PRINT), LOCK_EX) === false) {
+            return ['error' => 'Could not save auth file link.'];
+        }
+
+        return [
+            'token' => $token,
+            'expiresAt' => $expiresAtInt > 0 ? $expiresAtInt : null,
+        ];
+    }
+
+    public static function getAuthFileLinkRecord(string $token): ?array
+    {
+        $token = strtolower(trim($token));
+        if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
+            return null;
+        }
+
+        $now = time();
+        $readRecord = function (string $metaRoot, string $fallbackSourceId) use ($token, $now): ?array {
+            $path = self::authFileLinksPathForMetaRoot($metaRoot);
+            if (!is_file($path)) {
+                return null;
+            }
+
+            $links = self::readAuthFileLinks($path);
+            $cleaned = self::cleanAuthFileLinks($links, $now);
+            if ($cleaned !== $links) {
+                @file_put_contents($path, json_encode($cleaned, JSON_PRETTY_PRINT), LOCK_EX);
+            }
+            if (!isset($cleaned[$token]) || !is_array($cleaned[$token])) {
+                return null;
+            }
+
+            $record = $cleaned[$token];
+            $recordSourceId = trim((string)($record['sourceId'] ?? ''));
+            if ($recordSourceId === '') {
+                $record['sourceId'] = $fallbackSourceId;
+            }
+            return $record;
+        };
+
+        $currentId = class_exists('SourceContext') ? SourceContext::getActiveId() : '';
+        $record = $readRecord(self::metaRoot(), $currentId);
+        if ($record) {
+            return $record;
+        }
+
+        if (!class_exists('SourceContext') || !SourceContext::sourcesEnabled()) {
+            return null;
+        }
+
+        $sources = SourceContext::listAllSources();
+        foreach ($sources as $src) {
+            if (isset($src['enabled']) && !$src['enabled']) {
+                continue;
+            }
+            $id = (string)($src['id'] ?? '');
+            if ($id === '' || $id === $currentId) {
+                continue;
+            }
+
+            $record = $readRecord(SourceContext::metaRootForId($id), $id);
+            if ($record) {
+                return $record;
+            }
+        }
+
+        return null;
+    }
+
     /**
      * Retrieves the share record for a given token.
      *
@@ -2827,7 +3020,7 @@ class FileModel
      * @return array Returns an associative array with keys "token" and "expires" on success,
      *               or "error" on failure.
      */
-    public static function createShareLink($folder, $file, $expirationSeconds = 3600, $password = "")
+    public static function createShareLink($folder, $file, $expirationSeconds = 3600, $password = "", string $createdBy = "")
     {
         try {
             if (FolderCrypto::isEncryptedOrAncestor((string)$folder)) {
@@ -2875,12 +3068,17 @@ class FileModel
             }
         }
 
+        $createdBy = trim($createdBy);
+        $createdBy = preg_replace('/[\x00-\x1F\x7F]/', '', $createdBy);
+
         // Add new share record.
         $shareLinks[$token] = [
             "folder"   => $folder,
             "file"     => $file,
             "expires"  => $expires,
-            "password" => $hashedPassword
+            "password" => $hashedPassword,
+            "createdBy" => is_string($createdBy) ? $createdBy : '',
+            "createdAt" => time(),
         ];
 
         // Save the updated share links.

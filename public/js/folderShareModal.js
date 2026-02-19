@@ -2,6 +2,85 @@
 import { escapeHTML, showToast } from './domUtils.js?v={{APP_QVER}}';
 import { t } from './i18n.js?v={{APP_QVER}}';
 
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return true;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "absolute";
+  ta.style.left = "-9999px";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch (e) {
+    ok = false;
+  } finally {
+    ta.remove();
+  }
+  return ok;
+}
+
+function openFolderShareResultModal(link) {
+  const existing = document.getElementById("folderShareResultModal");
+  if (existing) existing.remove();
+
+  const modal = document.createElement("div");
+  modal.id = "folderShareResultModal";
+  modal.className = "modal";
+  modal.innerHTML = `
+    <div class="modal-content share-modal-content" style="max-width:560px;">
+      <div class="modal-header">
+        <h3>${t("share_link_generated")}</h3>
+        <span id="closeFolderShareResultModal" title="${t("close")}" class="close-image-modal">&times;</span>
+      </div>
+      <div class="modal-body">
+        <p style="margin-bottom:6px;">${t("shareable_link")}</p>
+        <input id="folderShareResultLinkInput" type="text" readonly style="width:100%;padding:6px;" />
+        <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
+          <button id="copyFolderShareResultBtn" class="btn btn-primary">${t("copy_link")}</button>
+          <button id="closeFolderShareResultBtn" class="btn btn-secondary">${t("close")}</button>
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  modal.style.display = "block";
+
+  const inputEl = document.getElementById("folderShareResultLinkInput");
+  if (inputEl) {
+    inputEl.value = link;
+    inputEl.focus();
+    inputEl.select();
+  }
+
+  const close = () => modal.remove();
+  const closeX = document.getElementById("closeFolderShareResultModal");
+  const closeBtn = document.getElementById("closeFolderShareResultBtn");
+  const copyBtn = document.getElementById("copyFolderShareResultBtn");
+
+  if (closeX) closeX.addEventListener("click", close);
+  if (closeBtn) closeBtn.addEventListener("click", close);
+  modal.addEventListener("click", (e) => {
+    if (e.target === modal) close();
+  });
+
+  if (copyBtn && inputEl) {
+    copyBtn.addEventListener("click", async () => {
+      try {
+        const ok = await copyTextToClipboard(inputEl.value);
+        showToast(ok ? t("link_copied") : t("unknown_error"));
+      } catch (e) {
+        showToast(t("unknown_error"));
+      }
+    });
+  }
+}
+
 export function openFolderShareModal(folder) {
   // Remove any existing modal
   const existing = document.getElementById("folderShareModal");
@@ -12,70 +91,86 @@ export function openFolderShareModal(folder) {
   modal.id = "folderShareModal";
   modal.classList.add("modal");
   modal.innerHTML = `
-    <div class="modal-content share-modal-content" style="width:600px;max-width:90vw;">
+    <div class="modal-content share-modal-content">
       <div class="modal-header">
-        <h3>${t("share_folder")}: ${escapeHTML(folder)}</h3>
+        <h3>${t("share_folder_and_request")}: ${escapeHTML(folder)}</h3>
         <span id="closeFolderShareModal" title="${t("close")}" class="close-image-modal">&times;</span>
       </div>
-      <div class="modal-body">
-        <p>${t("set_expiration")}</p>
-        <select id="folderShareExpiration" style="width:100%;padding:5px;">
-          <option value="30">30 ${t("minutes")}</option>
-          <option value="60" selected>60 ${t("minutes")}</option>
-          <option value="120">120 ${t("minutes")}</option>
-          <option value="180">180 ${t("minutes")}</option>
-          <option value="240">240 ${t("minutes")}</option>
-          <option value="1440">1 ${t("day")}</option>
-          <option value="custom">${t("custom")}&hellip;</option>
-        </select>
+      <div class="modal-body share-modal-body">
+        <p class="share-modal-helper">${t("share_folder_and_request_helper")}</p>
 
-        <div id="customFolderExpirationContainer" style="display:none;margin-top:10px;">
-          <label for="customFolderExpirationValue">${t("duration")}:</label>
-          <input type="number" id="customFolderExpirationValue" min="1" value="1" style="width:60px;margin:0 8px;"/>
-          <select id="customFolderExpirationUnit">
-            <option value="seconds">${t("seconds")}</option>
-            <option value="minutes" selected>${t("minutes")}</option>
-            <option value="hours">${t("hours")}</option>
-            <option value="days">${t("days")}</option>
-          </select>
-          <p class="share-warning" style="color:#a33;font-size:0.9em;margin-top:5px;">
-            ${t("custom_duration_warning")}
-          </p>
+        <div class="share-modal-section">
+          <p class="share-section-title">${t("share_mode_heading")}</p>
+          <div class="share-mode-toggle" role="group" aria-label="${t("share_mode_heading")}">
+            <button type="button" id="folderShareBrowseModeBtn" class="share-mode-btn is-active">
+              <span class="share-mode-btn-title">${t("share_mode_browse_label")}</span>
+              <span class="share-mode-btn-desc">${t("share_mode_browse_desc")}</span>
+            </button>
+            <button type="button" id="folderShareRequestModeBtn" class="share-mode-btn">
+              <span class="share-mode-btn-title">${t("share_mode_request_label")}</span>
+              <span class="share-mode-btn-desc">${t("share_mode_request_desc")}</span>
+            </button>
+          </div>
+          <p id="folderShareModeNotice" class="share-mode-notice"></p>
+          <input type="checkbox" id="folderShareDropMode" hidden />
         </div>
 
-        <p style="margin-top:15px;">${t("password_optional")}</p>
-        <input
-          type="text"
-          id="folderSharePassword"
-          placeholder="${t("enter_password")}"
-          style="width:100%;padding:5px;"
-        />
+        <div class="share-modal-section">
+          <p class="share-section-title">${t("share_link_settings")}</p>
+          <label class="share-field-label" for="folderShareExpiration">${t("set_expiration")}</label>
+          <select id="folderShareExpiration" class="share-field-input">
+            <option value="30">30 ${t("minutes")}</option>
+            <option value="60" selected>60 ${t("minutes")}</option>
+            <option value="120">120 ${t("minutes")}</option>
+            <option value="180">180 ${t("minutes")}</option>
+            <option value="240">240 ${t("minutes")}</option>
+            <option value="1440">1 ${t("day")}</option>
+            <option value="custom">${t("custom")}&hellip;</option>
+          </select>
 
-        <label style="margin-top:10px;display:block;">
-          <input type="checkbox" id="folderShareAllowUpload" />
-          ${t("allow_uploads")}
-        </label>
+          <div id="customFolderExpirationContainer" class="share-custom-expiration" style="display:none;">
+            <label for="customFolderExpirationValue">${t("duration")}:</label>
+            <input type="number" id="customFolderExpirationValue" min="1" value="1" />
+            <select id="customFolderExpirationUnit">
+              <option value="seconds">${t("seconds")}</option>
+              <option value="minutes" selected>${t("minutes")}</option>
+              <option value="hours">${t("hours")}</option>
+              <option value="days">${t("days")}</option>
+            </select>
+            <p class="share-warning">
+              ${t("custom_duration_warning")}
+            </p>
+          </div>
 
-        <label style="margin-top:6px;display:block;">
-          <input type="checkbox" id="folderShareAllowSubfolders" />
-          ${t("allow_subfolders")}
-        </label>
+          <label class="share-field-label" for="folderSharePassword">${t("password_optional")}</label>
+          <input
+            type="text"
+            id="folderSharePassword"
+            placeholder="${t("enter_password")}"
+            class="share-field-input"
+          />
+        </div>
+
+        <div class="share-modal-section">
+          <p class="share-section-title">${t("share_upload_settings")}</p>
+          <label class="share-check">
+            <input type="checkbox" id="folderShareAllowUpload" />
+            <span>${t("allow_uploads")}</span>
+          </label>
+          <label class="share-check">
+            <input type="checkbox" id="folderShareAllowSubfolders" />
+            <span>${t("allow_subfolders")}</span>
+          </label>
+          <div class="share-check-helper">${t("allow_subfolders_helper")}</div>
+        </div>
 
         <button
           id="generateFolderShareLinkBtn"
           class="btn btn-primary"
-          style="margin-top:15px;"
         >
           ${t("generate_share_link")}
         </button>
 
-        <div id="folderShareLinkDisplay" style="margin-top:15px;display:none;">
-          <p>${t("shareable_link")}</p>
-          <input type="text" id="folderShareLinkInput" readonly style="width:100%;padding:5px;"/>
-          <button id="copyFolderShareLinkBtn" class="btn btn-secondary" style="margin-top:5px;">
-            ${t("copy_link")}
-          </button>
-        </div>
       </div>
     </div>
   `;
@@ -93,6 +188,57 @@ export function openFolderShareModal(folder) {
         .style.display = e.target.value === "custom" ? "block" : "none";
     });
 
+  const allowUploadEl = document.getElementById("folderShareAllowUpload");
+  const dropModeEl = document.getElementById("folderShareDropMode");
+  const browseModeBtn = document.getElementById("folderShareBrowseModeBtn");
+  const requestModeBtn = document.getElementById("folderShareRequestModeBtn");
+  const modeNoticeEl = document.getElementById("folderShareModeNotice");
+
+  const syncModeVisuals = () => {
+    if (!dropModeEl) return;
+    const dropEnabled = !!dropModeEl.checked;
+    if (browseModeBtn) browseModeBtn.classList.toggle("is-active", !dropEnabled);
+    if (requestModeBtn) requestModeBtn.classList.toggle("is-active", dropEnabled);
+    if (modeNoticeEl) {
+      modeNoticeEl.textContent = dropEnabled
+        ? t("share_mode_notice_request")
+        : t("share_mode_notice_browse");
+    }
+  };
+
+  const syncDropMode = () => {
+    if (!allowUploadEl || !dropModeEl) return;
+    if (dropModeEl.checked) {
+      allowUploadEl.checked = true;
+      allowUploadEl.disabled = true;
+    } else {
+      allowUploadEl.disabled = false;
+    }
+    syncModeVisuals();
+  };
+
+  if (allowUploadEl && dropModeEl) {
+    if (browseModeBtn) {
+      browseModeBtn.addEventListener("click", () => {
+        dropModeEl.checked = false;
+        syncDropMode();
+      });
+    }
+    if (requestModeBtn) {
+      requestModeBtn.addEventListener("click", () => {
+        dropModeEl.checked = true;
+        syncDropMode();
+      });
+    }
+    allowUploadEl.addEventListener("change", () => {
+      if (!allowUploadEl.checked && dropModeEl.checked) {
+        dropModeEl.checked = false;
+      }
+      syncDropMode();
+    });
+    syncDropMode();
+  }
+
   // Generate link
   document.getElementById("generateFolderShareLinkBtn")
     .addEventListener("click", () => {
@@ -109,6 +255,7 @@ export function openFolderShareModal(folder) {
       const password    = document.getElementById("folderSharePassword").value;
       const allowUpload = document.getElementById("folderShareAllowUpload").checked ? 1 : 0;
       const allowSubfolders = document.getElementById("folderShareAllowSubfolders").checked ? 1 : 0;
+      const dropMode = document.getElementById("folderShareDropMode").checked ? 1 : 0;
       const csrfToken   = document.querySelector('meta[name="csrf-token"]').getAttribute("content");
       if (!csrfToken) {
         showToast(t("csrf_error"));
@@ -128,15 +275,15 @@ export function openFolderShareModal(folder) {
           expirationUnit: unit,
           password,
           allowUpload,
-          allowSubfolders
+          allowSubfolders,
+          mode: dropMode ? "drop" : "browse",
+          fileDrop: dropMode
         })
       })
       .then(r => r.json())
       .then(data => {
         if (data.token && data.link) {
-          document.getElementById("folderShareLinkInput").value = data.link;
-          document.getElementById("folderShareLinkDisplay").style.display = "block";
-          showToast(t("share_link_generated"));
+          openFolderShareResultModal(data.link);
         } else {
           showToast(t("error_generating_share_link") + ": " + (data.error||t("unknown_error")));
         }
@@ -145,14 +292,5 @@ export function openFolderShareModal(folder) {
         console.error(err);
         showToast(t("error_generating_share_link") + ": " + t("unknown_error"));
       });
-    });
-
-  // Copy
-  document.getElementById("copyFolderShareLinkBtn")
-    .addEventListener("click", () => {
-      const inp = document.getElementById("folderShareLinkInput");
-      inp.select();
-      document.execCommand("copy");
-      showToast(t("link_copied"));
     });
 }

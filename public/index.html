@@ -339,6 +339,9 @@
                 <button id="renameSelectedBtn" class="btn action-btn icon-only" disabled title="Rename">
                   <span class="material-icons" aria-hidden="true">drive_file_rename_outline</span>
                 </button>
+                <button id="linkSelectedBtn" class="btn action-btn icon-only" disabled title="Link file" data-i18n-title="link_file">
+                  <span class="material-icons" aria-hidden="true">link</span>
+                </button>
                 <button id="shareSelectedBtn" class="btn action-btn icon-only" disabled title="Share">
                   <span class="material-icons" aria-hidden="true">share</span>
                 </button>
@@ -638,6 +641,12 @@
             data-when="one">
       <i class="material-icons">sell</i>
       <span>Tag file</span>
+    </button>
+    <button type="button" class="mi"
+            data-action="link_file"
+            data-when="one">
+      <i class="material-icons">link</i>
+      <span>Link file</span>
     </button>
     <button type="button" class="mi"
     data-action="share_file"

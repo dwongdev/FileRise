@@ -110,6 +110,166 @@ function showLoginTip(message) {
 const LOGIN_FAIL_STORAGE_KEY = 'fr_login_fail_state';
 const LOGIN_FAIL_WINDOW_MS = 30 * 60 * 1000;
 const LOGIN_FAIL_MAX = 5;
+const AUTH_FILE_LINK_PARAM = 'fileLink';
+const AUTH_FILE_LINK_RETURN_KEY = 'fr_auth_file_link_return';
+const AUTH_FILE_LINK_TOKEN_RE = /^[a-f0-9]{64}$/i;
+
+// ---- Safe redirect helper (prevents open redirects) ----
+function sanitizeRedirect(raw, { fallback = '/' } = {}) {
+  if (!raw) return fallback;
+  try {
+    const str = String(raw).trim();
+    if (!str) return fallback;
+
+    // Resolve against current page so relative paths keep subpath mounts (e.g. /fr).
+    const candidate = new URL(str, window.location.href);
+
+    // Enforce same-origin
+    if (candidate.origin !== window.location.origin) {
+      return fallback;
+    }
+
+    // Limit to http/https
+    if (candidate.protocol !== 'http:' && candidate.protocol !== 'https:') {
+      return fallback;
+    }
+
+    // Return relative URL
+    return candidate.pathname + candidate.search + candidate.hash;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+function getCurrentRelativeUrl() {
+  return window.location.pathname + window.location.search + window.location.hash;
+}
+
+function rememberAuthFileLinkReturnUrl() {
+  try {
+    const current = new URL(window.location.href);
+    const token = String(current.searchParams.get(AUTH_FILE_LINK_PARAM) || '').trim();
+    if (!token) return;
+    const safe = sanitizeRedirect(getCurrentRelativeUrl(), { fallback: null });
+    if (safe) {
+      sessionStorage.setItem(AUTH_FILE_LINK_RETURN_KEY, safe);
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+function consumeAuthFileLinkReturnUrl() {
+  try {
+    const raw = sessionStorage.getItem(AUTH_FILE_LINK_RETURN_KEY) || '';
+    sessionStorage.removeItem(AUTH_FILE_LINK_RETURN_KEY);
+    if (!raw) return '';
+    const safe = sanitizeRedirect(raw, { fallback: null });
+    return safe || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function maybeRestoreAuthFileLinkReturnUrl() {
+  const target = consumeAuthFileLinkReturnUrl();
+  if (!target) return false;
+  try {
+    const targetUrl = new URL(target, window.location.href);
+    const token = String(targetUrl.searchParams.get(AUTH_FILE_LINK_PARAM) || '').trim();
+    if (!token) return false;
+    const currentSafe = sanitizeRedirect(getCurrentRelativeUrl(), { fallback: '' }) || '';
+    if (target === currentSafe) return false;
+    window.location.replace(target);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function clearAuthFileLinkFromUrl() {
+  try {
+    const url = new URL(window.location.href);
+    if (!url.searchParams.has(AUTH_FILE_LINK_PARAM)) return;
+    url.searchParams.delete(AUTH_FILE_LINK_PARAM);
+    const next =
+      url.pathname +
+      (url.search ? url.search : '') +
+      (url.hash || '');
+    window.history.replaceState(window.history.state || null, '', next);
+  } catch (e) {
+    // ignore
+  }
+}
+
+async function resolveAuthFileLinkIfPresent() {
+  let token = '';
+  try {
+    const url = new URL(window.location.href);
+    token = String(url.searchParams.get(AUTH_FILE_LINK_PARAM) || '').trim();
+  } catch (e) {
+    token = '';
+  }
+  if (!token) return;
+  if (!AUTH_FILE_LINK_TOKEN_RE.test(token)) {
+    window.showToast(t('file_link_invalid_or_expired'), 'error');
+    clearAuthFileLinkFromUrl();
+    return;
+  }
+
+  try {
+    const sourceInitPromise = window.__frSourceInitPromise;
+    if (sourceInitPromise && typeof sourceInitPromise.then === 'function') {
+      await sourceInitPromise.catch(() => {});
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  try {
+    const res = await fetch(withBase('/api/file/resolveAuthFileLink.php?token=' + encodeURIComponent(token)), {
+      method: 'GET',
+      credentials: 'include',
+      headers: { 'Accept': 'application/json' }
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data || data.ok !== true) {
+      if (res.status === 403) {
+        window.showToast(t('no_access_to_resource'), 'error');
+      } else if (res.status === 404 || res.status === 410) {
+        window.showToast(t('file_link_invalid_or_expired'), 'error');
+      } else {
+        const msg = (data && (data.error || data.message)) || t('file_link_resolve_failed');
+        window.showToast(msg, 'error');
+      }
+      return;
+    }
+
+    const folder = String(data.folder || 'root');
+    const file = String(data.file || '').trim();
+    const sourceId = String(data.sourceId || '').trim();
+    if (!file) {
+      window.showToast(t('file_link_invalid_or_expired'), 'error');
+      return;
+    }
+
+    const list = await import(withBase('/js/fileListView.js?v={{APP_QVER}}')).catch(async () => {
+      return import(withBase('/js/fileListView.js'));
+    });
+    if (list && typeof list.navigateToLinkedFile === 'function') {
+      await list.navigateToLinkedFile(folder, file, sourceId);
+    } else if (typeof window.loadFileList === 'function') {
+      window.currentFolder = folder || 'root';
+      await window.loadFileList(folder || 'root');
+    }
+    window.showToast(t('file_link_opened'), 'success');
+  } catch (e) {
+    window.showToast(t('file_link_resolve_failed'), 'error');
+  } finally {
+    clearAuthFileLinkFromUrl();
+    try { sessionStorage.removeItem(AUTH_FILE_LINK_RETURN_KEY); } catch (e) { }
+  }
+}
 
 function readLoginFailState(now = Date.now()) {
   try {
@@ -580,33 +740,6 @@ window.__FR_FLAGS.entryStarted = window.__FR_FLAGS.entryStarted || false;
     inFlight.set(key, { ts: now, promise: p });
     return p.then(r => r.clone());
   };
-
-    // ---- Safe redirect helper (prevents open redirects) ----
-    function sanitizeRedirect(raw, { fallback = '/' } = {}) {
-      if (!raw) return fallback;
-      try {
-        const str = String(raw).trim();
-        if (!str) return fallback;
-  
-        // Resolve against current page so relative paths keep subpath mounts (e.g. /fr).
-        const candidate = new URL(str, window.location.href);
-  
-        // Enforce same-origin
-        if (candidate.origin !== window.location.origin) {
-          return fallback;
-        }
-  
-        // Limit to http/https
-        if (candidate.protocol !== 'http:' && candidate.protocol !== 'https:') {
-          return fallback;
-        }
-  
-        // Return relative URL
-        return candidate.pathname + candidate.search + candidate.hash;
-      } catch (e) {
-        return fallback;
-      }
-    }
 
   // Gentle toast normalizer (compatible with showToast(message, duration))
   const origToast = window.showToast;
@@ -1562,7 +1695,10 @@ function bindDarkMode() {
     const oidcBtn = $('#oidcLoginBtn');
     if (oidcBtn && !oidcBtn.__bound) {
       oidcBtn.__bound = true;
-      oidcBtn.addEventListener('click', () => { window.location.href = withBase('/api/auth/auth.php?oidc=initiate'); });
+      oidcBtn.addEventListener('click', () => {
+        rememberAuthFileLinkReturnUrl();
+        window.location.href = withBase('/api/auth/auth.php?oidc=initiate');
+      });
     }
 
     const form = $('#authForm');
@@ -1799,6 +1935,8 @@ function bindDarkMode() {
 
 
         // 3) auth/header bits — pass real state so “Admin Panel” shows up
+        await resolveAuthFileLinkIfPresent();
+
         if (!window.__FR_FLAGS.wired.auth) {
           try {
             const auth = await import(withBase('/js/auth.js?v={{APP_QVER}}')).catch(async (err) => {
@@ -1878,6 +2016,9 @@ function bindDarkMode() {
 
     if (authed) {
       // Authenticated path: show app, hide login
+      if (maybeRestoreAuthFileLinkReturnUrl()) {
+        return;
+      }
       document.body.classList.remove('fr-login-view');
       document.body.classList.add('authed');
       unhide(wrap);            // works whether CSS or [hidden] was used
@@ -1897,6 +2038,7 @@ function bindDarkMode() {
     unhide(mainEl);
     unhide(login);
     if (login) login.style.display = '';
+    rememberAuthFileLinkReturnUrl();
     // …wire stuff…
     applySiteConfig(window.__FR_SITE_CFG__ || {}, { phase: 'final' });
     applyDarkMode();
